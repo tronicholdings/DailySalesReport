@@ -536,7 +536,23 @@ function onGPS(pos){
   if(document.getElementById('mCI').classList.contains('open')&&!ca.value&&geo)
     geo.geocode({location:{lat:lat,lng:lng}},function(r,s){if(s==='OK'&&r[0])ca.value=r[0].formatted_address;});
 }
-function cmi(){if(!gpoly||gpts.length<2)return 0;return google.maps.geometry.spherical.computeLength(gpoly.getPath().getArray())*0.000621371;}
+/* Haversine distance between two lat/lng points (miles) */
+function haverMi(a, b){
+  var R=3958.8; // Earth radius in miles
+  var dLat=(b.lat-a.lat)*Math.PI/180;
+  var dLon=(b.lng-a.lng)*Math.PI/180;
+  var sinLat=Math.sin(dLat/2);
+  var sinLon=Math.sin(dLon/2);
+  var h=sinLat*sinLat+Math.cos(a.lat*Math.PI/180)*Math.cos(b.lat*Math.PI/180)*sinLon*sinLon;
+  return R*2*Math.asin(Math.sqrt(h));
+}
+/* Total distance from GPS points array — no Google Maps dependency */
+function cmi(){
+  if(gpts.length<2)return 0;
+  var total=0;
+  for(var i=1;i<gpts.length;i++)total+=haverMi(gpts[i-1],gpts[i]);
+  return total;
+}
 
 /* ── Check In / Out ────────────────────── */
 function mainAct(){
@@ -758,11 +774,11 @@ function doSend(){
       rep_name:    rep,
       date:        t0.toLocaleDateString('en-US',{month:'long',day:'numeric',year:'numeric'}),
       message:     msg,
-      map_url:     mapUrl,
-      maps_link:   mapsLink,
-      gps_start:   gpsStart ? gpsStart.lat.toFixed(5)+', '+gpsStart.lng.toFixed(5) : 'N/A',
-      gps_end:     gpsEnd   ? gpsEnd.lat.toFixed(5)+', '+gpsEnd.lng.toFixed(5)     : 'N/A',
-      total_miles: gmi.toFixed(1)
+      map_url:     mapUrl    || 'https://maps.googleapis.com/maps/api/staticmap?size=640x200&zoom=10&center=34.0,-118.1&key=AIzaSyClcWpuT__fvAhvbAd2MDeaKEPL5UI_FVc',
+      maps_link:   mapsLink  || 'https://maps.google.com',
+      gps_start:   gpsStart  ? gpsStart.lat.toFixed(5)+', '+gpsStart.lng.toFixed(5) : 'GPS not available',
+      gps_end:     gpsEnd    ? gpsEnd.lat.toFixed(5)+', '+gpsEnd.lng.toFixed(5)     : 'GPS not available',
+      total_miles: gmi.toFixed(1) || '0.0'
     }).then(function(){
       active=false;
       clearInterval(tickID);
