@@ -242,7 +242,7 @@ input:focus,select:focus,textarea:focus{border-color:rgba(76,156,255,.75);box-sh
       <div class="logo-line"><span class="logo-premium">PREMIUM</span><span class="logo-k">K</span></div>
       <div class="logo-sub">TRONIC HOLDINGS</div>
       <div style="margin-top:6px;font-size:11px;color:#7d8590;letter-spacing:.5px;">
-        Ver 2.0 &nbsp;·&nbsp; Updated Jul 03, 2026
+        Ver 2.2 &nbsp;·&nbsp; Updated Jul 04, 2026
       </div>
     </div>
     <div class="hero-title">Daily Field Sales Report</div>
@@ -411,7 +411,7 @@ input:focus,select:focus,textarea:focus{border-color:rgba(76,156,255,.75);box-sh
 <div class="overlay" id="mEnd">
   <div class="sheet">
     <div class="bar"></div><div class="sh-title">🏁 End Shift</div>
-    <div class="sh-field"><label>Odometer End (mi) <small style="color:#7d8590">(optional)</small></label><input type="number" id="endOdo" placeholder="0" inputmode="numeric"></div>
+    <div class="sh-field"><label>My Actual Miles Driven Today <small style="color:#7d8590">(optional)</small></label><input type="number" id="endOdo" placeholder="e.g. 42.5 — enter what your car shows" inputmode="decimal" step="0.1"></div>
     <div class="sh-field"><label>Daily Summary <small style="color:#7d8590">(optional)</small></label><textarea id="endSum" placeholder="Highlights, issues..."></textarea></div>
     <div class="sh-field"><label>Tomorrow's Plan <small style="color:#7d8590">(optional)</small></label><textarea id="endPlan" placeholder="Planned visits..."></textarea></div>
     <div class="sh-btns">
@@ -428,6 +428,7 @@ var rep='', vehicle='Company Vehicle';
 var t0=null, active=false, tickID=null, elapsed=0;
 var evs=[], curLoc=null, ciTime=null, man={s:'',e:'',c:''};
 var gw=null, gpts=[], gmap=null, gpoly=null, gmk=null, geo=null, wl=null;
+var lastFix=null, mileageTimer=null, mileagePts=[];
 var mapsOk=false, ejsOk=false;
 
 /* ── Departure ─────────────────────────── */
@@ -504,6 +505,17 @@ function p2(n){return String(n).padStart(2,'0');}
 function startGPS(){
   if(!navigator.geolocation)return;
   gw=navigator.geolocation.watchPosition(onGPS,function(){},{enableHighAccuracy:true,timeout:20000,maximumAge:5000});
+  if(mileageTimer)clearInterval(mileageTimer);
+  mileageTimer=setInterval(takeMileageCheckpoint,30000);
+}
+/* Record a mileage checkpoint every 30s from the latest raw GPS fix.
+   This avoids summing every ~5s GPS jitter reading (which inflates
+   distance while parked/stationary) and better approximates the
+   actual road distance traveled between stops. */
+function takeMileageCheckpoint(){
+  if(!lastFix)return;
+  mileagePts.push({lat:lastFix.lat,lng:lastFix.lng,t:Date.now()});
+  document.getElementById('mMi').textContent=cmi().toFixed(2);
 }
 function loadMaps(){
   if(mapsOk)return;
@@ -527,7 +539,13 @@ function initMap(lat,lng){
 }
 function onGPS(pos){
   var lat=pos.coords.latitude,lng=pos.coords.longitude,now=new Date();
-  if(gpts.length===0&&mapsOk)initMap(lat,lng);
+  lastFix={lat:lat,lng:lng}; // always keep latest raw fix for checkpoint timer
+  if(gpts.length===0){
+    if(mapsOk)initMap(lat,lng);
+    // seed the very first mileage checkpoint immediately so a short
+    // shift (under 30s) still records a starting point
+    mileagePts.push({lat:lat,lng:lng,t:now.getTime()});
+  }
   gpts.push({lat:lat,lng:lng,t:now.getTime()});
   if(gpoly)gpoly.getPath().push(new google.maps.LatLng(lat,lng));
   if(gmk)gmk.setMap(null);
@@ -549,11 +567,24 @@ function haverMi(a, b){
   var h=sinLat*sinLat+Math.cos(a.lat*Math.PI/180)*Math.cos(b.lat*Math.PI/180)*sinLon*sinLon;
   return R*2*Math.asin(Math.sqrt(h));
 }
-/* Total distance from GPS points array — no Google Maps dependency */
+/* Minimum distance (mi) between two 30s checkpoints to count as real
+   movement. Filters out GPS drift/jitter recorded while parked —
+   typical stationary jitter is a few meters; ~0.02mi (~32m) is a
+   safe floor that still captures genuine slow-speed driving. */
+var JITTER_FLOOR_MI = 0.02;
+
+/* Total distance from 30-second mileage checkpoints (not raw GPS
+   points). Checkpointing avoids counting jitter from parked/stationary
+   time and gives a more realistic road-mileage estimate than summing
+   every ~5s GPS reading. */
 function cmi(){
-  if(gpts.length<2)return 0;
+  var pts = mileagePts.length >= 2 ? mileagePts : gpts;
+  if(pts.length<2)return 0;
   var total=0;
-  for(var i=1;i<gpts.length;i++)total+=haverMi(gpts[i-1],gpts[i]);
+  for(var i=1;i<pts.length;i++){
+    var d=haverMi(pts[i-1],pts[i]);
+    if(d>=JITTER_FLOOR_MI)total+=d;
+  }
   return total;
 }
 
@@ -682,7 +713,7 @@ function buildMapsLink(pts, stops){
 /* ── doSend ───────────────────────────────────────────────── */
 function doSend(){
   var now=new Date();
-  var oe=document.getElementById('endOdo').value||man.e||'';
+  var oe=(document.getElementById('endOdo').value||'').trim();
   var es=(document.getElementById('endSum').value||'').trim();
   var ep=(document.getElementById('endPlan').value||'').trim();
 
@@ -694,7 +725,16 @@ function doSend(){
   var hrs=(tot/3600).toFixed(2);
   var gmi=cmi();
   var isP=vehicle==='Personal Vehicle';
-  var omi=(oe&&man.s)?(parseFloat(oe)-parseFloat(man.s)).toFixed(1):'—';
+  // Self-reported miles: rep enters what they believe they drove today
+  // (their own odometer/estimate), used only to compare against the
+  // app's GPS-calculated mileage — not used for pay calculation.
+  var repMi = oe ? parseFloat(oe) : null;
+  var repMiTxt = repMi!==null && !isNaN(repMi) ? repMi.toFixed(1) : '—';
+  var diffTxt = '—';
+  if(repMi!==null && !isNaN(repMi)){
+    var diff = gmi - repMi;
+    diffTxt = (diff>=0?'+':'') + diff.toFixed(1) + ' mi (app vs. rep)';
+  }
 
   // GPS start / end / check-in stops
   var gpsStart = gpts.length ? gpts[0]             : null;
@@ -754,12 +794,14 @@ function doSend(){
 'Shift End:    '+ft(now)+'\n'+
 'Total Hours:  '+p2(Math.floor(tot/3600))+'h '+p2(Math.floor((tot%3600)/60))+'m ('+hrs+' hrs)\n'+
 (isP?
-  'GPS Miles:    '+gmi.toFixed(1)+' mi\n'+
-  'Odo Miles:    '+omi+' mi\n'+
-  'Mileage Pay:  $'+(gmi*0.35).toFixed(2)+' ($0.35/mi)\n':
-  'Miles (Odo):  '+omi+' mi\n'+
-  'GPS Miles:    '+gmi.toFixed(1)+' mi\n'+
-  '(Company vehicle)\n')+
+  'GPS Miles:      '+gmi.toFixed(1)+' mi (app-calculated, used for pay)\n'+
+  'Rep-Reported:   '+repMiTxt+' mi (self-reported, optional)\n'+
+  'Variance:       '+diffTxt+'\n'+
+  'Mileage Pay:    $'+(gmi*0.35).toFixed(2)+' ($0.35/mi, based on GPS)\n':
+  'GPS Miles:      '+gmi.toFixed(1)+' mi\n'+
+  'Rep-Reported:   '+repMiTxt+' mi (self-reported, optional)\n'+
+  'Variance:       '+diffTxt+'\n'+
+  '(Company vehicle — no mileage pay)\n')+
 '\n📍 VISITS ('+ci.length+' stops)\n─────────────\n'+vl+
 '\n\n🗺 ROUTE TIMELINE\n─────────────\n'+lines.join('\n')+
 '\n\n📡 GPS SUMMARY\n─────────────\n'+locLines+
@@ -785,6 +827,7 @@ function doSend(){
     }).then(function(){
       active=false;
       clearInterval(tickID);
+      if(mileageTimer)clearInterval(mileageTimer);
       if(gw)navigator.geolocation.clearWatch(gw);
       if(wl)wl.release();
       localStorage.removeItem('_ts3');
@@ -843,7 +886,7 @@ document.addEventListener('visibilitychange',function(){
 /* ── Save/Restore ──────────────────────── */
 function save(){
   if(!active)return;
-  try{localStorage.setItem('_ts3',JSON.stringify({rep:rep,vehicle:vehicle,depName:depName,depAddr:depAddr,t0:t0.getTime(),evs:evs.map(function(e){return Object.assign({},e,{t:e.t instanceof Date?e.t.getTime():e.t});}),curLoc:curLoc,ciTime:ciTime?ciTime.getTime():null,gpts:gpts.slice(-300),man:man,saved:Date.now()}));}catch(x){}
+  try{localStorage.setItem('_ts3',JSON.stringify({rep:rep,vehicle:vehicle,depName:depName,depAddr:depAddr,t0:t0.getTime(),evs:evs.map(function(e){return Object.assign({},e,{t:e.t instanceof Date?e.t.getTime():e.t});}),curLoc:curLoc,ciTime:ciTime?ciTime.getTime():null,gpts:gpts.slice(-300),mileagePts:mileagePts.slice(-500),man:man,saved:Date.now()}));}catch(x){}
 }
 function restore(){
   try{
@@ -853,7 +896,7 @@ function restore(){
     rep=s.rep;vehicle=s.vehicle;depName=s.depName;depAddr=s.depAddr;
     t0=new Date(s.t0);active=true;
     evs=(s.evs||[]).map(function(e){return Object.assign({},e,{t:new Date(e.t)});});
-    curLoc=s.curLoc;ciTime=s.ciTime?new Date(s.ciTime):null;gpts=s.gpts||[];man=s.man||{s:'',e:'',c:''};
+    curLoc=s.curLoc;ciTime=s.ciTime?new Date(s.ciTime):null;gpts=s.gpts||[];mileagePts=s.mileagePts||[];man=s.man||{s:'',e:'',c:''};
     document.getElementById('tbRep').textContent=rep;
     document.getElementById('tbDate').textContent=t0.toLocaleDateString('en-US',{weekday:'short',month:'short',day:'numeric',year:'numeric'});
     document.getElementById('setupPanel').style.display='none';
