@@ -242,7 +242,7 @@ input:focus,select:focus,textarea:focus{border-color:rgba(76,156,255,.75);box-sh
       <div class="logo-line"><span class="logo-premium">PREMIUM</span><span class="logo-k">K</span></div>
       <div class="logo-sub">TRONIC HOLDINGS</div>
       <div style="margin-top:6px;font-size:11px;color:#7d8590;letter-spacing:.5px;">
-        Ver 2.2 &nbsp;·&nbsp; Updated Jul 04, 2026
+        Ver 2.4 &nbsp;·&nbsp; Updated Jul 06, 2026
       </div>
     </div>
     <div class="hero-title">Daily Field Sales Report</div>
@@ -333,6 +333,11 @@ input:focus,select:focus,textarea:focus{border-color:rgba(76,156,255,.75);box-sh
       <div class="mp"><div class="mpl">MILES</div><div class="mpv" id="mMi">0.00</div></div>
       <div class="mp"><div class="mpl">UPDATED</div><div class="mpv" id="mUpd">—</div></div>
     </div>
+  </div>
+
+  <div id="gpsBanner" style="display:none;margin:0 12px 10px;padding:11px 13px;border-radius:10px;font-size:12px;line-height:1.5;"></div>
+  <div style="margin:0 12px 10px;padding:9px 13px;background:rgba(68,147,248,0.06);border:1px solid rgba(68,147,248,0.18);border-radius:10px;font-size:11px;color:#7d8590;line-height:1.5;">
+    💡 Keep this screen unlocked and open while driving — GPS tracking pauses when the phone locks or you switch apps.
   </div>
 
   <div class="btn-row">
@@ -428,7 +433,8 @@ var rep='', vehicle='Company Vehicle';
 var t0=null, active=false, tickID=null, elapsed=0;
 var evs=[], curLoc=null, ciTime=null, man={s:'',e:'',c:''};
 var gw=null, gpts=[], gmap=null, gpoly=null, gmk=null, geo=null, wl=null;
-var lastFix=null, mileageTimer=null, mileagePts=[];
+var gpsStatus='idle'; // idle | active | denied | paused
+var gpsRetryTimer=null, wakeReacquireTimer=null;
 var mapsOk=false, ejsOk=false;
 
 /* ── Departure ─────────────────────────── */
@@ -484,9 +490,30 @@ function startShift(){
   renderTL();
   tickID=setInterval(tick,1000);
   setTimeout(function(){loadMaps();startGPS();},300);
-  if(navigator.wakeLock)navigator.wakeLock.request('screen').then(function(w){wl=w;}).catch(function(){});
+  reacquireWakeLock();
+  if(wakeReacquireTimer)clearInterval(wakeReacquireTimer);
+  // iOS can silently release the wake lock on its own (e.g. Low Power
+  // Mode, thermal throttling) without firing a visibilitychange event,
+  // so periodically make sure it's still held.
+  wakeReacquireTimer=setInterval(reacquireWakeLock,120000);
   setInterval(save,30000);save();
   return true;
+}
+/* Request (or re-request) the screen wake lock. Safe to call anytime —
+   no-ops if already held or unsupported. */
+function reacquireWakeLock(){
+  if(!navigator.wakeLock || !active) return;
+  if(wl && !wl.released) return;
+  navigator.wakeLock.request('screen').then(function(w){
+    wl=w;
+    wl.addEventListener('release', function(){
+      // OS released it behind our back; try again shortly if we're
+      // still on shift and the page is visible.
+      if(active && document.visibilityState==='visible'){
+        setTimeout(reacquireWakeLock, 2000);
+      }
+    });
+  }).catch(function(){});
 }
 
 /* ── Timer ─────────────────────────────── */
@@ -502,20 +529,49 @@ function tick(){
 function p2(n){return String(n).padStart(2,'0');}
 
 /* ── GPS & Maps ────────────────────────── */
-function startGPS(){
-  if(!navigator.geolocation)return;
-  gw=navigator.geolocation.watchPosition(onGPS,function(){},{enableHighAccuracy:true,timeout:20000,maximumAge:5000});
-  if(mileageTimer)clearInterval(mileageTimer);
-  mileageTimer=setInterval(takeMileageCheckpoint,30000);
+function setGpsBanner(kind, msg){
+  var el=document.getElementById('gpsBanner');
+  if(!kind){ el.style.display='none'; return; }
+  var styles={
+    denied:'background:rgba(248,81,73,0.1);border:1px solid rgba(248,81,73,0.35);color:#f85149;',
+    paused:'background:rgba(240,136,62,0.1);border:1px solid rgba(240,136,62,0.35);color:#f0883e;',
+    active:'background:rgba(63,185,80,0.1);border:1px solid rgba(63,185,80,0.35);color:#3fb950;'
+  };
+  el.style.cssText='margin:0 12px 10px;padding:11px 13px;border-radius:10px;font-size:12px;line-height:1.5;display:block;'+(styles[kind]||'');
+  el.textContent=msg;
 }
-/* Record a mileage checkpoint every 30s from the latest raw GPS fix.
-   This avoids summing every ~5s GPS jitter reading (which inflates
-   distance while parked/stationary) and better approximates the
-   actual road distance traveled between stops. */
-function takeMileageCheckpoint(){
-  if(!lastFix)return;
-  mileagePts.push({lat:lastFix.lat,lng:lastFix.lng,t:Date.now()});
-  document.getElementById('mMi').textContent=cmi().toFixed(2);
+function startGPS(){
+  if(!navigator.geolocation){
+    setGpsBanner('denied','⚠️ This browser does not support GPS location.');
+    return;
+  }
+  if(gw)navigator.geolocation.clearWatch(gw);
+  gw=navigator.geolocation.watchPosition(onGPS, onGpsError,
+    {enableHighAccuracy:true, timeout:15000, maximumAge:0});
+  // Immediate one-shot fix too, so we don't wait for the first
+  // watchPosition callback (helps close the gap right after Start
+  // Shift or after returning from background).
+  navigator.geolocation.getCurrentPosition(onGPS, onGpsError,
+    {enableHighAccuracy:true, timeout:15000, maximumAge:0});
+  // Keep retrying in the background in case permission was denied at
+  // first and the rep enables it later mid-shift via Settings — this
+  // requires no app restart, tracking picks up as soon as it's granted.
+  if(gpsRetryTimer)clearInterval(gpsRetryTimer);
+  gpsRetryTimer=setInterval(function(){
+    if(gpsStatus!=='active'){
+      navigator.geolocation.getCurrentPosition(onGPS, onGpsError,
+        {enableHighAccuracy:true, timeout:15000, maximumAge:0});
+    }
+  }, 30000);
+}
+function onGpsError(err){
+  if(err && err.code===1){ // PERMISSION_DENIED
+    gpsStatus='denied';
+    setGpsBanner('denied','⚠️ Location access is off. Go to Settings → Privacy → Location Services and allow it — tracking will resume automatically once enabled.');
+  }
+  // Other errors (timeout / position unavailable) are usually
+  // transient while driving through areas with weak signal; the
+  // retry timer and next watchPosition callback will recover.
 }
 function loadMaps(){
   if(mapsOk)return;
@@ -539,13 +595,8 @@ function initMap(lat,lng){
 }
 function onGPS(pos){
   var lat=pos.coords.latitude,lng=pos.coords.longitude,now=new Date();
-  lastFix={lat:lat,lng:lng}; // always keep latest raw fix for checkpoint timer
-  if(gpts.length===0){
-    if(mapsOk)initMap(lat,lng);
-    // seed the very first mileage checkpoint immediately so a short
-    // shift (under 30s) still records a starting point
-    mileagePts.push({lat:lat,lng:lng,t:now.getTime()});
-  }
+  if(gpsStatus!=='active'){ gpsStatus='active'; setGpsBanner(null); }
+  if(gpts.length===0&&mapsOk)initMap(lat,lng);
   gpts.push({lat:lat,lng:lng,t:now.getTime()});
   if(gpoly)gpoly.getPath().push(new google.maps.LatLng(lat,lng));
   if(gmk)gmk.setMap(null);
@@ -567,18 +618,25 @@ function haverMi(a, b){
   var h=sinLat*sinLat+Math.cos(a.lat*Math.PI/180)*Math.cos(b.lat*Math.PI/180)*sinLon*sinLon;
   return R*2*Math.asin(Math.sqrt(h));
 }
-/* Minimum distance (mi) between two 30s checkpoints to count as real
-   movement. Filters out GPS drift/jitter recorded while parked —
-   typical stationary jitter is a few meters; ~0.02mi (~32m) is a
-   safe floor that still captures genuine slow-speed driving. */
-var JITTER_FLOOR_MI = 0.02;
+/* Minimum distance (mi) between two consecutive GPS fixes to count as
+   real movement. Filters out GPS drift/jitter while parked (typical
+   stationary jitter is a few meters — well under this floor), without
+   discarding genuine driving segments. */
+var JITTER_FLOOR_MI = 0.008; // ~13m
 
-/* Total distance from 30-second mileage checkpoints (not raw GPS
-   points). Checkpointing avoids counting jitter from parked/stationary
-   time and gives a more realistic road-mileage estimate than summing
-   every ~5s GPS reading. */
+/* Total distance from the continuous GPS trail (gpts), not from sparse
+   time-based checkpoints. Straight-line (Haversine) distance between
+   two points UNDERCOUNTS actual road distance whenever the road curves
+   or turns between those points — the wider the gap between samples,
+   the worse this "corner-cutting" gets. 30-second checkpoints were
+   tried in v2.1 to reduce parked-GPS-jitter, but on real routes with
+   turns/curves and any background-tracking gaps, they undercounted
+   total mileage significantly (e.g. 240mi app vs 303mi actual on a
+   10hr test). Using every recorded GPS fix instead follows the actual
+   path far more closely, while the small per-segment floor above still
+   filters out stationary jitter. */
 function cmi(){
-  var pts = mileagePts.length >= 2 ? mileagePts : gpts;
+  var pts = gpts;
   if(pts.length<2)return 0;
   var total=0;
   for(var i=1;i<pts.length;i++){
@@ -601,7 +659,7 @@ function doCI(){
   var n=(document.getElementById('ciName').value||'').trim();if(!n){return;}
   var now=new Date(),l=gpts.length?gpts[gpts.length-1]:null;
   curLoc={n:n,a:(document.getElementById('ciAddr').value||'').trim(),p:document.getElementById('ciPurp').value,no:(document.getElementById('ciNote').value||'').trim(),lat:l?l.lat:null,lng:l?l.lng:null};
-  ciTime=now;evs.push({tp:'ci',t:now,n:curLoc.n,a:curLoc.a,p:curLoc.p,no:curLoc.no});
+  ciTime=now;evs.push({tp:'ci',t:now,n:curLoc.n,a:curLoc.a,p:curLoc.p,no:curLoc.no,lat:curLoc.lat,lng:curLoc.lng});
   closeModal('mCI');
   if(gmap&&l)new google.maps.Marker({position:{lat:l.lat,lng:l.lng},map:gmap,label:{text:String(evs.filter(function(e){return e.tp==='ci';}).length),color:'#0d1117',fontSize:'11px',fontWeight:'700'},icon:{path:google.maps.SymbolPath.CIRCLE,scale:11,fillColor:'#3fb950',fillOpacity:1,strokeColor:'#fff',strokeWeight:2}});
   document.getElementById('statusBox').className='status at';
@@ -698,10 +756,13 @@ function buildMapsLink(pts, stops){
   var s=pts[0], e=pts[pts.length-1];
   var url='https://www.google.com/maps/dir/'
         +s.lat.toFixed(5)+','+s.lng.toFixed(5);
-  // Up to 8 intermediate waypoints
+  // Include all check-in stops (in visit order) so the Google Maps
+  // link gives a true point-by-point route for cross-checking mileage,
+  // not just a direct start→end line. (Capped at 23 to keep the URL
+  // reasonably sized; most shifts won't have more stops than that.)
   if(stops&&stops.length){
     samplePts(
-      stops.filter(function(st){return st.lat&&st.lng;}), 8
+      stops.filter(function(st){return st.lat&&st.lng;}), 23
     ).forEach(function(wp){
       url+='/'+wp.lat.toFixed(5)+','+wp.lng.toFixed(5);
     });
@@ -827,9 +888,10 @@ function doSend(){
     }).then(function(){
       active=false;
       clearInterval(tickID);
-      if(mileageTimer)clearInterval(mileageTimer);
+      if(gpsRetryTimer)clearInterval(gpsRetryTimer);
+      if(wakeReacquireTimer)clearInterval(wakeReacquireTimer);
       if(gw)navigator.geolocation.clearWatch(gw);
-      if(wl)wl.release();
+      if(wl && !wl.released)wl.release();
       localStorage.removeItem('_ts3');
       btn.textContent='✅ Sent!';
       btn.style.background='#238636';
@@ -877,16 +939,24 @@ function ds(ms){var m=Math.round(ms/60000);return m<60?m+'m':Math.floor(m/60)+'h
 document.addEventListener('visibilitychange',function(){
   if(!active)return;
   if(document.visibilityState==='visible'){
-    if(navigator.wakeLock&&!wl)navigator.wakeLock.request('screen').then(function(w){wl=w;}).catch(function(){});
-    if(!gw)startGPS();
+    reacquireWakeLock();
+    startGPS(); // restarts watchPosition + takes an immediate fresh fix
+    if(gpsStatus==='active') setGpsBanner(null);
     restore();
-  }else save();
+  }else{
+    // Being backgrounded/locked pauses tracking on iOS Safari — this
+    // is a platform limitation of web apps, not something JS can fix.
+    // Just reflect it honestly so the rep knows why points may thin
+    // out, and resume immediately once foregrounded again above.
+    if(gpsStatus==='active') gpsStatus='paused';
+    save();
+  }
 });
 
 /* ── Save/Restore ──────────────────────── */
 function save(){
   if(!active)return;
-  try{localStorage.setItem('_ts3',JSON.stringify({rep:rep,vehicle:vehicle,depName:depName,depAddr:depAddr,t0:t0.getTime(),evs:evs.map(function(e){return Object.assign({},e,{t:e.t instanceof Date?e.t.getTime():e.t});}),curLoc:curLoc,ciTime:ciTime?ciTime.getTime():null,gpts:gpts.slice(-300),mileagePts:mileagePts.slice(-500),man:man,saved:Date.now()}));}catch(x){}
+  try{localStorage.setItem('_ts3',JSON.stringify({rep:rep,vehicle:vehicle,depName:depName,depAddr:depAddr,t0:t0.getTime(),evs:evs.map(function(e){return Object.assign({},e,{t:e.t instanceof Date?e.t.getTime():e.t});}),curLoc:curLoc,ciTime:ciTime?ciTime.getTime():null,gpts:gpts.slice(-300),man:man,saved:Date.now()}));}catch(x){}
 }
 function restore(){
   try{
@@ -896,14 +966,16 @@ function restore(){
     rep=s.rep;vehicle=s.vehicle;depName=s.depName;depAddr=s.depAddr;
     t0=new Date(s.t0);active=true;
     evs=(s.evs||[]).map(function(e){return Object.assign({},e,{t:new Date(e.t)});});
-    curLoc=s.curLoc;ciTime=s.ciTime?new Date(s.ciTime):null;gpts=s.gpts||[];mileagePts=s.mileagePts||[];man=s.man||{s:'',e:'',c:''};
+    curLoc=s.curLoc;ciTime=s.ciTime?new Date(s.ciTime):null;gpts=s.gpts||[];man=s.man||{s:'',e:'',c:''};
     document.getElementById('tbRep').textContent=rep;
     document.getElementById('tbDate').textContent=t0.toLocaleDateString('en-US',{weekday:'short',month:'short',day:'numeric',year:'numeric'});
     document.getElementById('setupPanel').style.display='none';
     document.getElementById('appPanel').style.display='block';
     tickID=setInterval(tick,1000);
     setTimeout(function(){loadMaps();startGPS();},300);
-    if(navigator.wakeLock)navigator.wakeLock.request('screen').then(function(w){wl=w;}).catch(function(){});
+    reacquireWakeLock();
+    if(wakeReacquireTimer)clearInterval(wakeReacquireTimer);
+    wakeReacquireTimer=setInterval(reacquireWakeLock,120000);
     renderTL();
     if(curLoc){document.getElementById('statusBox').className='status at';document.getElementById('stVal').textContent='📍 At: '+curLoc.n;document.getElementById('mainBtn').className='abtn a-co';document.getElementById('mainLbl').textContent='Check Out';}
     setInterval(save,30000);
