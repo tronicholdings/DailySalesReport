@@ -242,7 +242,7 @@ input:focus,select:focus,textarea:focus{border-color:rgba(76,156,255,.75);box-sh
       <div class="logo-line"><span class="logo-premium">PREMIUM</span><span class="logo-k">K</span></div>
       <div class="logo-sub">TRONIC HOLDINGS</div>
       <div style="margin-top:6px;font-size:11px;color:#7d8590;letter-spacing:.5px;">
-        Ver 2.4 &nbsp;·&nbsp; Updated Jul 06, 2026
+        Ver 2.7 &nbsp;·&nbsp; Updated Jul 12, 2026
       </div>
     </div>
     <div class="hero-title">Daily Field Sales Report</div>
@@ -362,29 +362,10 @@ input:focus,select:focus,textarea:focus{border-color:rgba(76,156,255,.75);box-sh
 <div class="overlay" id="mCI">
   <div class="sheet">
     <div class="bar"></div><div class="sh-title">📍 Check In</div>
-    <div class="sh-field"><label>Location Name</label><input type="text" id="ciName" placeholder="Company or place" autocorrect="off" autocomplete="off"></div>
-    <div class="sh-field"><label>Address &nbsp;<span class="gps-hint">auto GPS</span></label><input type="text" id="ciAddr" placeholder="Auto-filled from GPS..." autocorrect="off"></div>
-    <div class="sh-field"><label>Purpose</label>
-      <select id="ciPurp"><option value="Sales Call">💼 Sales Call</option><option value="Delivery">📦 Delivery</option><option value="Follow-up">🔄 Follow-up</option><option value="Meeting">🤝 Meeting</option><option value="Other">📌 Other</option></select>
-    </div>
-    <div class="sh-field"><label>Notes <small style="color:#7d8590">(optional)</small></label><textarea id="ciNote" placeholder="Contact name, products..."></textarea></div>
+    <div class="sh-field"><label>Location Name</label><input type="text" id="ciName" placeholder="Company or place name" autocorrect="off" autocomplete="off"></div>
     <div class="sh-btns">
       <button type="button" class="sh-btn sh-cancel" onclick="closeModal('mCI')">Cancel</button>
       <button type="button" class="sh-btn sh-ok" onclick="doCI()">✅ Check In</button>
-    </div>
-  </div>
-</div>
-
-<div class="overlay" id="mCO">
-  <div class="sheet">
-    <div class="bar"></div><div class="sh-title" id="coTitle">🚗 Check Out</div>
-    <div class="sh-field"><label>Outcome</label>
-      <select id="coResult"><option value="Closed / Order">✅ Closed / Order</option><option value="Follow-up Needed">🔄 Follow-up Needed</option><option value="No Deal">❌ No Deal</option><option value="Delivery Done">📦 Delivery Done</option><option value="Meeting Done">🤝 Meeting Done</option></select>
-    </div>
-    <div class="sh-field"><label>Notes <small style="color:#7d8590">(optional)</small></label><textarea id="coNote" placeholder="Next steps..."></textarea></div>
-    <div class="sh-btns">
-      <button type="button" class="sh-btn sh-cancel" onclick="closeModal('mCO')">Cancel</button>
-      <button type="button" class="sh-btn sh-ok" onclick="doCO()">🚗 Depart</button>
     </div>
   </div>
 </div>
@@ -524,7 +505,6 @@ function tick(){
   document.getElementById('kTime').textContent=h+'h '+p2(m)+'m';
   document.getElementById('kMi').textContent=cmi().toFixed(1);
   document.getElementById('kStops').textContent=evs.filter(function(e){return e.tp==='ci';}).length;
-  if(curLoc&&ciTime)document.getElementById('stSub').textContent='Arrived '+ft(ciTime)+' · '+ds(Date.now()-ciTime.getTime())+' here';
 }
 function p2(n){return String(n).padStart(2,'0');}
 
@@ -593,11 +573,24 @@ function initMap(lat,lng){
   gpoly=new google.maps.Polyline({path:[],geodesic:true,strokeColor:'#4493f8',strokeOpacity:1,strokeWeight:4,map:gmap});
   new google.maps.Marker({position:{lat:lat,lng:lng},map:gmap,icon:{path:google.maps.SymbolPath.CIRCLE,scale:8,fillColor:'#4493f8',fillOpacity:1,strokeColor:'#fff',strokeWeight:2}});
 }
+/* Reject fixes with poor accuracy (typical of indoor / parking-garage /
+   urban-canyon signal bounce). Without this, a single bad fix can jump
+   50-500m from the last good point and get counted as real driving
+   distance, even while the vehicle is parked. 50m is generous enough
+   to keep normal phone GPS fixes (usually 5-20m) while dropping the
+   multipath outliers that were inflating mileage. */
+var GPS_ACCURACY_LIMIT_M = 50;
 function onGPS(pos){
-  var lat=pos.coords.latitude,lng=pos.coords.longitude,now=new Date();
+  var lat=pos.coords.latitude,lng=pos.coords.longitude,now=new Date(),acc=pos.coords.accuracy;
+  if(typeof acc==='number'&&acc>GPS_ACCURACY_LIMIT_M){
+    // Still counts as a "live" GPS signal (clears denied/paused banner)
+    // but is too imprecise to trust for distance — skip adding the point.
+    if(gpsStatus!=='active'){ gpsStatus='active'; setGpsBanner(null); }
+    return;
+  }
   if(gpsStatus!=='active'){ gpsStatus='active'; setGpsBanner(null); }
   if(gpts.length===0&&mapsOk)initMap(lat,lng);
-  gpts.push({lat:lat,lng:lng,t:now.getTime()});
+  gpts.push({lat:lat,lng:lng,t:now.getTime(),acc:(pos.coords.accuracy||30),spd:(pos.coords.speed!=null&&pos.coords.speed>=0?pos.coords.speed:null)});
   if(gpoly)gpoly.getPath().push(new google.maps.LatLng(lat,lng));
   if(gmk)gmk.setMap(null);
   if(gmap){gmk=new google.maps.Marker({position:{lat:lat,lng:lng},map:gmap,icon:{path:google.maps.SymbolPath.FORWARD_CLOSED_ARROW,scale:5,fillColor:'#3fb950',fillOpacity:1,strokeColor:'#fff',strokeWeight:2,rotation:pos.coords.heading||0}});gmap.panTo({lat:lat,lng:lng});}
@@ -618,71 +611,129 @@ function haverMi(a, b){
   var h=sinLat*sinLat+Math.cos(a.lat*Math.PI/180)*Math.cos(b.lat*Math.PI/180)*sinLon*sinLon;
   return R*2*Math.asin(Math.sqrt(h));
 }
-/* Minimum distance (mi) between two consecutive GPS fixes to count as
-   real movement. Filters out GPS drift/jitter while parked (typical
-   stationary jitter is a few meters — well under this floor), without
-   discarding genuine driving segments. */
+/* Minimum distance (mi) to count as real movement, applied on top of
+   the accuracy-based floor below. Covers the case where accuracy is
+   unusually good (e.g. 3-5m) but the device still reports tiny jitter. */
 var JITTER_FLOOR_MI = 0.008; // ~13m
 
-/* Total distance from the continuous GPS trail (gpts), not from sparse
-   time-based checkpoints. Straight-line (Haversine) distance between
-   two points UNDERCOUNTS actual road distance whenever the road curves
-   or turns between those points — the wider the gap between samples,
-   the worse this "corner-cutting" gets. 30-second checkpoints were
-   tried in v2.1 to reduce parked-GPS-jitter, but on real routes with
-   turns/curves and any background-tracking gaps, they undercounted
-   total mileage significantly (e.g. 240mi app vs 303mi actual on a
-   10hr test). Using every recorded GPS fix instead follows the actual
-   path far more closely, while the small per-segment floor above still
-   filters out stationary jitter. */
+/* Upper bound on how large the accuracy-based floor is allowed to
+   grow. Without a cap, a single very poor fix (accuracy can report
+   several hundred meters deep indoors or in a parking structure)
+   could suppress real movement for an unreasonably long stretch. */
+var ACC_FLOOR_CAP_MI = 0.06; // ~97m
+
+/* Total distance from the continuous GPS trail (gpts), using an
+   accuracy-aware "anchor" method instead of blindly summing every
+   consecutive pair:
+     - Each GPS fix carries pos.coords.accuracy (meters) — how large
+       the true-position uncertainty circle is. This is NOT constant:
+       it degrades badly indoors, in parking structures, and between
+       tall buildings (can go from ~10m to 200-500m).
+     - The old fixed 13m floor ignored accuracy entirely, so a noisy
+       fix while parked (accuracy 100m+) could look like "movement"
+       past the floor and get added — inflating mileage over a full
+       day of stop-and-go visits.
+     - Fix: the floor required to accept a move now scales with the
+       combined uncertainty of the two points being compared
+       (accA + accB), capped at ACC_FLOOR_CAP_MI so one bad fix can't
+       swallow a long stretch of real driving.
+     - We also track a moving "anchor" point rather than always
+       comparing to the immediately previous fix: if a fix is rejected
+       as noise, the anchor stays put and the NEXT fix is compared
+       against that same anchor. This avoids losing genuine slow
+       movement that happens to arrive in several small below-floor
+       steps (each step alone under the floor, but the total drift
+       away from the anchor is real). */
 function cmi(){
   var pts = gpts;
   if(pts.length<2)return 0;
   var total=0;
+  var anchor=pts[0];
   for(var i=1;i<pts.length;i++){
-    var d=haverMi(pts[i-1],pts[i]);
-    if(d>=JITTER_FLOOR_MI)total+=d;
+    var p=pts[i];
+    var straight=haverMi(anchor,p);
+    var accA=(anchor.acc!=null?anchor.acc:30);
+    var accB=(p.acc!=null?p.acc:30);
+    var accFloorMi=Math.min(ACC_FLOOR_CAP_MI,(accA+accB)/1609.34);
+    var floor=Math.max(JITTER_FLOOR_MI,accFloorMi);
+    if(straight>=floor){
+      // Real movement confirmed. On any gap where the road curves or
+      // turns between two fixes, the straight-line distance UNDER-
+      // counts the actual path (this gets worse the longer the gap —
+      // e.g. after the phone was locked/backgrounded for minutes on a
+      // highway). When the device reports a speed for either fix
+      // (coords.speed, m/s — the GPS chip derives this from Doppler
+      // shift independent of position accuracy), integrate speed×time
+      // for this gap as a second estimate and take whichever is
+      // larger. This directly compensates for corner-cutting instead
+      // of just filtering noise.
+      var segDist=straight;
+      if(anchor.spd!=null || p.spd!=null){
+        var dtSec=(p.t-anchor.t)/1000;
+        if(dtSec>0){
+          var speeds=[];
+          if(anchor.spd!=null)speeds.push(anchor.spd);
+          if(p.spd!=null)speeds.push(p.spd);
+          var avgSpd=speeds.reduce(function(a,b){return a+b;},0)/speeds.length; // m/s
+          var speedDistMi=avgSpd*dtSec/1609.34;
+          // Sanity cap: don't let one bad speed reading imply a
+          // sustained >90mph pace over a long silent gap.
+          var capMi=dtSec*(90/3600);
+          segDist=Math.max(straight, Math.min(speedDistMi, capMi));
+        }
+      }
+      total+=segDist;
+      anchor=p;
+    }
+    // else: within combined GPS uncertainty — treat as noise, keep
+    // the same anchor and re-test against the next fix.
   }
   return total;
 }
 
-/* ── Check In / Out ────────────────────── */
+/* ── Check In (single-tap) ─────────────── */
+/* Simplified per field feedback: reps found the old two-step
+   Check In → (visit) → Check Out flow too slow for quick drop-offs.
+   Now a single tap + place name instantly logs a visit marker (with
+   GPS coordinates + address captured silently in the background) and
+   the app immediately returns to Driving — no separate Check Out
+   step required. Stay-duration/outcome tracking was removed along
+   with this; the report now just lists each stop by name and time. */
 function mainAct(){
-  if(curLoc){document.getElementById('coTitle').textContent='🚗 Leaving: '+curLoc.n;document.getElementById('coNote').value='';openModal('mCO');}
-  else{
-    document.getElementById('ciName').value='';document.getElementById('ciAddr').value='';document.getElementById('ciNote').value='';
-    if(gpts.length&&geo){var l=gpts[gpts.length-1];geo.geocode({location:{lat:l.lat,lng:l.lng}},function(r,s){if(s==='OK'&&r[0])document.getElementById('ciAddr').value=r[0].formatted_address;});}
-    openModal('mCI');
-  }
+  document.getElementById('ciName').value='';
+  openModal('mCI');
+  setTimeout(function(){document.getElementById('ciName').focus();},250);
 }
 function doCI(){
-  var n=(document.getElementById('ciName').value||'').trim();if(!n){return;}
-  var now=new Date(),l=gpts.length?gpts[gpts.length-1]:null;
-  curLoc={n:n,a:(document.getElementById('ciAddr').value||'').trim(),p:document.getElementById('ciPurp').value,no:(document.getElementById('ciNote').value||'').trim(),lat:l?l.lat:null,lng:l?l.lng:null};
-  ciTime=now;evs.push({tp:'ci',t:now,n:curLoc.n,a:curLoc.a,p:curLoc.p,no:curLoc.no,lat:curLoc.lat,lng:curLoc.lng});
+  var n=(document.getElementById('ciName').value||'').trim();
+  if(!n){return;}
+  var now=new Date(), l=gpts.length?gpts[gpts.length-1]:null;
+  var ev={tp:'ci',t:now,n:n,a:'',lat:l?l.lat:null,lng:l?l.lng:null};
+  evs.push(ev);
   closeModal('mCI');
-  if(gmap&&l)new google.maps.Marker({position:{lat:l.lat,lng:l.lng},map:gmap,label:{text:String(evs.filter(function(e){return e.tp==='ci';}).length),color:'#0d1117',fontSize:'11px',fontWeight:'700'},icon:{path:google.maps.SymbolPath.CIRCLE,scale:11,fillColor:'#3fb950',fillOpacity:1,strokeColor:'#fff',strokeWeight:2}});
-  document.getElementById('statusBox').className='status at';
-  document.getElementById('stVal').textContent='📍 At: '+n;
-  document.getElementById('stSub').textContent='Arrived '+ft(now);
-  document.getElementById('mainBtn').className='abtn a-co';document.getElementById('mainLbl').textContent='Check Out';
-  renderTL();save();
-}
-function doCO(){
-  if(!curLoc)return;
-  var now=new Date(),d=now.getTime()-ciTime.getTime();
-  evs.push({tp:'co',t:now,n:curLoc.n,r:document.getElementById('coResult').value,no:(document.getElementById('coNote').value||'').trim(),d:d});
-  closeModal('mCO');curLoc=null;ciTime=null;
-  document.getElementById('statusBox').className='status';
-  document.getElementById('stVal').textContent='🚗 Driving';document.getElementById('stSub').textContent='Tap Check In when you arrive';
-  document.getElementById('mainBtn').className='abtn a-ci';document.getElementById('mainLbl').textContent='Check In';
+  // Fill in the address in the background — doesn't block the flow,
+  // just enriches the report if it resolves before Send.
+  if(l&&geo){
+    geo.geocode({location:{lat:l.lat,lng:l.lng}},function(r,s){
+      if(s==='OK'&&r[0])ev.a=r[0].formatted_address;
+    });
+  }
+  if(gmap&&l){
+    new google.maps.Marker({position:{lat:l.lat,lng:l.lng},map:gmap,
+      label:{text:String(evs.filter(function(e){return e.tp==='ci';}).length),color:'#0d1117',fontSize:'11px',fontWeight:'700'},
+      icon:{path:google.maps.SymbolPath.CIRCLE,scale:11,fillColor:'#3fb950',fillOpacity:1,strokeColor:'#fff',strokeWeight:2}});
+  }
+  document.getElementById('stSub').textContent='✅ Checked in — '+n;
+  setTimeout(function(){
+    document.getElementById('stSub').textContent='Tap Check In when you arrive';
+  },2500);
   renderTL();save();
 }
 function doNote(){var t=(document.getElementById('noteText').value||'').trim();if(!t)return;evs.push({tp:'note',t:new Date(),tx:t});document.getElementById('noteText').value='';closeModal('mNote');renderTL();save();}
 function doMan(){man.s=document.getElementById('manS').value;man.e=document.getElementById('manE').value;man.c=document.getElementById('manC').value;closeModal('mMan');}
 
 /* ── End Shift ─────────────────────────── */
-function onEnd(){if(curLoc){openModal('mCO');return;}openModal('mEnd');}
+function onEnd(){openModal('mEnd');}
 /* ── Polyline encoder ─────────────────────────────────────── */
 function _pv(v){
   v=v<0?~(v<<1):v<<1;
@@ -814,13 +865,7 @@ function doSend(){
       lines.push(ft(e.t)+'  🏢 DEPARTED — '+e.n+(e.a&&e.a!==e.n?' ('+e.a+')':''));
     } else if(e.tp==='ci'){
       if(dm>0)lines.push('           ↓ '+dm+' min drive from '+pn);
-      lines.push(ft(e.t)+'  📍 ARRIVED — '+e.n+(e.a?' ('+e.a+')':''));
-      if(e.p) lines.push('           Purpose: '+e.p);
-      if(e.no)lines.push('           Note: '+e.no);
-      pv=e.t; pn=e.n;
-    } else if(e.tp==='co'){
-      lines.push(ft(e.t)+'  🚗 LEFT — '+e.n+' (stayed '+ds(e.d)+')');
-      lines.push('           Result: '+e.r+(e.no?' | '+e.no:''));
+      lines.push(ft(e.t)+'  📍 '+e.n+(e.a?' ('+e.a+')':''));
       pv=e.t; pn=e.n;
     } else if(e.tp==='ret'){
       if(dm>0)lines.push('           ↓ '+dm+' min drive from '+pn);
@@ -831,9 +876,8 @@ function doSend(){
   });
 
   var ci=evs.filter(function(e){return e.tp==='ci';});
-  var co=evs.filter(function(e){return e.tp==='co';});
-  var vl=co.map(function(c,i){
-    return '  '+(i+1)+'. '+(ci[i]?ci[i].n:'?')+' — '+ds(c.d)+' — '+c.r;
+  var vl=ci.map(function(c,i){
+    return '  '+(i+1)+'. '+c.n+' — '+ft(c.t);
   }).join('\n')||'  None';
 
   // GPS location summary
@@ -917,8 +961,7 @@ function renderTL(){
   evs.forEach(function(e,i){
     var last=i===evs.length-1,dc='',bc='#30363d',pl='',det='',tag='';
     if(e.tp==='dep'){bc='#4493f8';pl='🏢 '+e.n;det=e.a&&e.a!==e.n?e.a:'';tag='<span class="tag tag-b">Shift Start</span>';}
-    else if(e.tp==='ci'){bc='#3fb950';pl='📍 '+e.n;det=(e.a||'')+(e.no?(e.a?'<br>':'')+e.no:'');if(e.p)tag='<span class="tag tag-b">'+e.p+'</span>';}
-    else if(e.tp==='co'){bc='#30363d';pl='🚗 Left: '+e.n;det='Stay: '+ds(e.d)+(e.no?'<br>'+e.no:'');var tc=e.r==='Closed / Order'?'tag-g':e.r==='No Deal'?'tag-r':'tag-d';tag='<span class="tag '+tc+'">'+e.r+'</span>';}
+    else if(e.tp==='ci'){bc='#3fb950';pl='📍 '+e.n;det=e.a||'';tag='<span class="tag tag-g">Checked In</span>';}
     else if(e.tp==='ret'){bc='#4493f8';pl='🏁 '+e.n;tag='<span class="tag tag-b">Shift End</span>';}
     else if(e.tp==='note'){bc='#f0883e';pl='📝 Note';det=e.tx;}
     h+='<div class="tl-item"><div class="tl-s"><div class="dot" style="background:'+bc+'"></div>'+(last?'':'<div class="tl-l"></div>')+'</div><div class="tl-c"><div class="tl-t">'+ft(e.t)+'</div><div class="tl-p">'+pl+'</div>'+(det?'<div class="tl-d">'+det+'</div>':'')+tag+'</div></div>';
@@ -977,7 +1020,6 @@ function restore(){
     if(wakeReacquireTimer)clearInterval(wakeReacquireTimer);
     wakeReacquireTimer=setInterval(reacquireWakeLock,120000);
     renderTL();
-    if(curLoc){document.getElementById('statusBox').className='status at';document.getElementById('stVal').textContent='📍 At: '+curLoc.n;document.getElementById('mainBtn').className='abtn a-co';document.getElementById('mainLbl').textContent='Check Out';}
     setInterval(save,30000);
   }catch(x){}
 }
