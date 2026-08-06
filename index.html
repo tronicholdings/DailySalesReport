@@ -242,7 +242,7 @@ input:focus,select:focus,textarea:focus{border-color:rgba(76,156,255,.75);box-sh
       <div class="logo-line"><span class="logo-premium">PREMIUM</span><span class="logo-k">K</span></div>
       <div class="logo-sub">TRONIC HOLDINGS</div>
       <div style="margin-top:6px;font-size:11px;color:#7d8590;letter-spacing:.5px;">
-        Ver 2.7 &nbsp;·&nbsp; Updated Jul 12, 2026
+        Ver 2.8 &nbsp;·&nbsp; Updated Aug 05, 2026
       </div>
     </div>
     <div class="hero-title">Daily Field Sales Report</div>
@@ -857,6 +857,22 @@ function doSend(){
   var mapUrl   = buildMapUrl(gpts, ciStops);
   var mapsLink = buildMapsLink(gpts, ciStops);
 
+  // HTML legend matching the numbered pins on the map (Google Static
+  // Maps marker labels only support a single character, so the pin
+  // itself can only show "1", "2", "3"... — this legend is meant to
+  // sit directly under the map image in the email so the numbers,
+  // stop names, and check-in times line up with what's on the map).
+  var legendHtml = ciStops.map(function(c,i){
+    return '<tr>'+
+      '<td style="padding:4px 8px 4px 0;color:#4c9cff;font-weight:700;white-space:nowrap;">'+(i+1)+'.</td>'+
+      '<td style="padding:4px 8px;">'+escHtml(c.n)+'</td>'+
+      '<td style="padding:4px 0;color:#7d8590;white-space:nowrap;text-align:right;">'+ft(c.t)+'</td>'+
+    '</tr>';
+  }).join('');
+  var legendTable = ciStops.length
+    ? '<table style="width:100%;border-collapse:collapse;font-size:13px;font-family:sans-serif;">'+legendHtml+'</table>'
+    : '';
+
   // Route timeline text
   var lines=[],pv=t0,pn=depName;
   evs.forEach(function(e){
@@ -928,7 +944,8 @@ function doSend(){
       maps_link:   mapsLink  || 'https://maps.google.com',
       gps_start:   gpsStart  ? gpsStart.lat.toFixed(5)+', '+gpsStart.lng.toFixed(5) : 'GPS not available',
       gps_end:     gpsEnd    ? gpsEnd.lat.toFixed(5)+', '+gpsEnd.lng.toFixed(5)     : 'GPS not available',
-      total_miles: gmi.toFixed(1) || '0.0'
+      total_miles: gmi.toFixed(1) || '0.0',
+      visit_legend: legendTable || '<p style="color:#7d8590;font-size:13px;">No check-ins recorded.</p>'
     }).then(function(){
       active=false;
       clearInterval(tickID);
@@ -976,6 +993,7 @@ document.querySelectorAll('.overlay').forEach(function(o){o.addEventListener('cl
 
 /* ── Helpers ───────────────────────────── */
 function ft(d){if(!d)return'';return d.toLocaleTimeString('en-US',{hour:'numeric',minute:'2-digit',hour12:true});}
+function escHtml(s){return String(s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');}
 function ds(ms){var m=Math.round(ms/60000);return m<60?m+'m':Math.floor(m/60)+'h '+(m%60)+'m';}
 
 /* ── Visibility ────────────────────────── */
