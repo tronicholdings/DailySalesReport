@@ -242,7 +242,7 @@ input:focus,select:focus,textarea:focus{border-color:rgba(76,156,255,.75);box-sh
       <div class="logo-line"><span class="logo-premium">PREMIUM</span><span class="logo-k">K</span></div>
       <div class="logo-sub">TRONIC HOLDINGS</div>
       <div style="margin-top:6px;font-size:11px;color:#7d8590;letter-spacing:.5px;">
-        Ver 2.8 &nbsp;·&nbsp; Updated Aug 05, 2026
+        Ver 2.9 &nbsp;·&nbsp; Updated Aug 12, 2026
       </div>
     </div>
     <div class="hero-title">Daily Field Sales Report</div>
@@ -268,6 +268,7 @@ input:focus,select:focus,textarea:focus{border-color:rgba(76,156,255,.75);box-sh
       <option>SuEun Kim</option>
       <option>Shine Narae</option>
       <option>Billy Sim</option>
+      <option>Joshua Jung</option>
       <option value="x">Other (type below)</option>
     </select>
     <div id="otherDiv" style="display:none">
@@ -947,6 +948,7 @@ function doSend(){
       total_miles: gmi.toFixed(1) || '0.0',
       visit_legend: legendTable || '<p style="color:#7d8590;font-size:13px;">No check-ins recorded.</p>'
     }).then(function(){
+      syncToERP(); // 이메일 발송 성공 후 Tronic ERP로도 근무/방문기록 자동 전송 (실패해도 이메일 리포트에는 영향 없음)
       active=false;
       clearInterval(tickID);
       if(gpsRetryTimer)clearInterval(gpsRetryTimer);
@@ -968,6 +970,35 @@ function loadEJS(cb){
   s.src='https://cdn.jsdelivr.net/npm/@emailjs/browser@4/dist/email.min.js';
   s.onload=function(){emailjs.init('1xqHVrcs5xrGDcNed');ejsOk=true;cb();};
   document.head.appendChild(s);
+}
+
+/* ── Tronic ERP 연동 ──────────────────────
+   기존 이메일 리포트는 그대로 유지하면서, 같은 데이터를 Tronic ERP의
+   업무일지(방문기록/근태) 화면에도 자동으로 쌓이도록 전송한다.
+   실패해도(오프라인 등) 이메일 발송 자체는 이미 끝난 뒤라 리포트 전송에는 영향 없음. */
+var ERP_SYNC_URL = 'https://tronic-erp2-production.up.railway.app/api/worklog/sync-shift';
+var ERP_SYNC_KEY = 'Vyu6XFinHT8V0tHi6_lRQPOa7RF99a15'; // Railway Variables의 WORKLOG_SYNC_KEY와 동일해야 함
+function syncToERP(){
+  try{
+    var now=new Date();
+    var ciList=evs.filter(function(e){return e.tp==='ci';}).map(function(c){
+      return {name:c.n, time:c.t.toISOString(), note:c.a||''};
+    });
+    var payload={
+      rep_name: rep,
+      work_date: t0.toISOString().slice(0,10),
+      clock_in_at: t0.toISOString(),
+      clock_out_at: now.toISOString(),
+      miles: cmi(),
+      vehicle_type: vehicle==='Personal Vehicle' ? 'Personal' : 'Company Car',
+      check_ins: ciList
+    };
+    fetch(ERP_SYNC_URL,{
+      method:'POST',
+      headers:{'Content-Type':'application/json','x-worklog-sync-key':ERP_SYNC_KEY},
+      body:JSON.stringify(payload)
+    }).catch(function(){/* 네트워크 오류는 조용히 무시 — 이메일 리포트가 이미 기록 원본 역할을 함 */});
+  }catch(x){/* 동기화 실패해도 앱 흐름에는 영향 없음 */}
 }
 
 /* ── Timeline ──────────────────────────── */
