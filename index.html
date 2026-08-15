@@ -242,7 +242,7 @@ input:focus,select:focus,textarea:focus{border-color:rgba(76,156,255,.75);box-sh
       <div class="logo-line"><span class="logo-premium">PREMIUM</span><span class="logo-k">K</span></div>
       <div class="logo-sub">TRONIC HOLDINGS</div>
       <div style="margin-top:6px;font-size:11px;color:#7d8590;letter-spacing:.5px;">
-        Ver 2.10 &nbsp;·&nbsp; Updated Aug 12, 2026
+        Ver 3.0 &nbsp;&middot;&nbsp; Updated Aug 13, 2026
       </div>
     </div>
     <div class="hero-title">Daily Field Sales Report</div>
@@ -948,7 +948,7 @@ function doSend(){
       total_miles: gmi.toFixed(1) || '0.0',
       visit_legend: legendTable || '<p style="color:#7d8590;font-size:13px;">No check-ins recorded.</p>'
     }).then(function(){
-      syncToERP(); // 이메일 발송 성공 후 Tronic ERP로도 근무/방문기록 자동 전송 (실패해도 이메일 리포트에는 영향 없음)
+      syncToERP(btn); // 이메일 발송 성공 후 Tronic ERP로도 근무/방문기록 자동 전송 (실패해도 이메일 리포트에는 영향 없음)
       active=false;
       clearInterval(tickID);
       if(gpsRetryTimer)clearInterval(gpsRetryTimer);
@@ -978,7 +978,7 @@ function loadEJS(cb){
    실패해도(오프라인 등) 이메일 발송 자체는 이미 끝난 뒤라 리포트 전송에는 영향 없음. */
 var ERP_SYNC_URL = 'https://tronic-erp2-production.up.railway.app/api/worklog/sync-shift';
 var ERP_SYNC_KEY = 'Vyu6XFinHT8V0tHi6_lRQPOa7RF99a15'; // Railway Variables의 WORKLOG_SYNC_KEY와 동일해야 함
-function syncToERP(){
+function syncToERP(btnEl){
   try{
     var ciList=evs.filter(function(e){return e.tp==='ci';}).map(function(c){
       return {name:c.n, time:c.t.toISOString(), address:c.a||''};
@@ -993,8 +993,41 @@ function syncToERP(){
       method:'POST',
       headers:{'Content-Type':'application/json','x-worklog-sync-key':ERP_SYNC_KEY},
       body:JSON.stringify(payload)
-    }).catch(function(){/* 네트워크 오류는 조용히 무시 — 이메일 리포트가 이미 기록 원본 역할을 함 */});
-  }catch(x){/* 동기화 실패해도 앱 흐름에는 영향 없음 */}
+    }).then(function(r){
+      if(!r.ok){
+        r.text().then(function(t){
+          console.error('[ERP 동기화 실패] status='+r.status+' body='+t);
+          showSyncBadge(btnEl, false, 'ERP 동기화 실패 ('+r.status+')');
+        });
+      } else {
+        console.log('[ERP 동기화 성공]');
+        showSyncBadge(btnEl, true, 'ERP 동기화 완료 ('+ciList.length+'건)');
+      }
+    }).catch(function(e){
+      console.error('[ERP 동기화 네트워크 오류]', e);
+      showSyncBadge(btnEl, false, 'ERP 연결 실패 (네트워크/카톡브라우저 제한 가능)');
+    });
+  }catch(x){
+    console.error('[ERP 동기화 예외]', x);
+    showSyncBadge(btnEl, false, 'ERP 동기화 오류');
+  }
+}
+
+// 전송 버튼 바로 아래에, ERP 동기화 성공/실패를 조용히 표시 (이메일 리포트 흐름은 방해하지 않음)
+function showSyncBadge(btnEl, ok, text){
+  try{
+    var el=document.getElementById('erpSyncBadge');
+    if(!el){
+      el=document.createElement('div');
+      el.id='erpSyncBadge';
+      el.style.cssText='margin-top:8px;padding:6px 10px;border-radius:6px;font-size:12px;font-weight:600;text-align:center;';
+      if(btnEl && btnEl.parentElement){ btnEl.insertAdjacentElement('afterend', el); }
+      else document.body.appendChild(el);
+    }
+    el.textContent=(ok?'✅ ':'⚠️ ')+text;
+    el.style.background=ok?'#173a2b':'#3a1717';
+    el.style.color=ok?'#7ee2a8':'#ff9d9d';
+  }catch(x){}
 }
 
 /* ── Timeline ──────────────────────────── */
