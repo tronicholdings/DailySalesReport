@@ -242,7 +242,7 @@ input:focus,select:focus,textarea:focus{border-color:rgba(76,156,255,.75);box-sh
       <div class="logo-line"><span class="logo-premium">PREMIUM</span><span class="logo-k">K</span></div>
       <div class="logo-sub">TRONIC HOLDINGS</div>
       <div style="margin-top:6px;font-size:11px;color:#7d8590;letter-spacing:.5px;">
-        Ver 3.1 &nbsp;&middot;&nbsp; Updated Sep 03, 2026
+        Ver 3.3 &nbsp;&middot;&nbsp; Updated Sep 03, 2026
       </div>
     </div>
     <div class="hero-title">Daily Field Sales Report</div>
@@ -575,24 +575,27 @@ function initMap(lat,lng){
   gpoly=new google.maps.Polyline({path:[],geodesic:true,strokeColor:'#4493f8',strokeOpacity:1,strokeWeight:4,map:gmap});
   new google.maps.Marker({position:{lat:lat,lng:lng},map:gmap,icon:{path:google.maps.SymbolPath.CIRCLE,scale:8,fillColor:'#4493f8',fillOpacity:1,strokeColor:'#fff',strokeWeight:2}});
 }
-/* Reject fixes with poor accuracy (typical of indoor / parking-garage /
-   urban-canyon signal bounce). Without this, a single bad fix can jump
-   50-500m from the last good point and get counted as real driving
-   distance, even while the vehicle is parked. 50m is generous enough
-   to keep normal phone GPS fixes (usually 5-20m) while dropping the
-   multipath outliers that were inflating mileage. */
-var GPS_ACCURACY_LIMIT_M = 50;
+/* NOTE (found during full audit, Sep 2026): a hard 50m accuracy
+   cutoff used to live here, silently dropping any GPS fix worse than
+   that — including the string of degraded-accuracy fixes a phone
+   normally reports for the first 30-60s after reacquiring signal
+   (tunnel exits, parking structures, urban canyons, or right after
+   the screen unlocks). Simulated test: an 80s / 1.44mi highway
+   segment right after a signal reacquisition undercounted to 0.63mi
+   (-56%) with that hard filter, vs 1.35mi (-6%) without it. The
+   accuracy-aware anchor + floor system in cmi() below already
+   discounts poor-accuracy fixes appropriately (requiring more
+   apparent movement before trusting them, capped at ACC_FLOOR_CAP_MI)
+   — it does not need a second, cruder filter on top that just throws
+   the data away. Removed; every fix is now kept and let cmi() weigh
+   it by its own reported accuracy. */
 function onGPS(pos){
-  var lat=pos.coords.latitude,lng=pos.coords.longitude,now=new Date(),acc=pos.coords.accuracy;
-  if(typeof acc==='number'&&acc>GPS_ACCURACY_LIMIT_M){
-    // Still counts as a "live" GPS signal (clears denied/paused banner)
-    // but is too imprecise to trust for distance — skip adding the point.
-    if(gpsStatus!=='active'){ gpsStatus='active'; setGpsBanner(null); }
-    return;
-  }
+  var lat=pos.coords.latitude,lng=pos.coords.longitude,acc=pos.coords.accuracy;
+  var tms=(typeof pos.timestamp==='number'?pos.timestamp:Date.now());
+  var now=new Date(tms);
   if(gpsStatus!=='active'){ gpsStatus='active'; setGpsBanner(null); }
   if(gpts.length===0&&mapsOk)initMap(lat,lng);
-  gpts.push({lat:lat,lng:lng,t:now.getTime(),acc:(pos.coords.accuracy||30),spd:(pos.coords.speed!=null&&pos.coords.speed>=0?pos.coords.speed:null)});
+  gpts.push({lat:lat,lng:lng,t:tms,acc:(acc||30),spd:(pos.coords.speed!=null&&pos.coords.speed>=0?pos.coords.speed:null)});
   if(gpoly)gpoly.getPath().push(new google.maps.LatLng(lat,lng));
   if(gmk)gmk.setMap(null);
   if(gmap){gmk=new google.maps.Marker({position:{lat:lat,lng:lng},map:gmap,icon:{path:google.maps.SymbolPath.FORWARD_CLOSED_ARROW,scale:5,fillColor:'#3fb950',fillOpacity:1,strokeColor:'#fff',strokeWeight:2,rotation:pos.coords.heading||0}});gmap.panTo({lat:lat,lng:lng});}
@@ -645,12 +648,33 @@ var ACC_FLOOR_CAP_MI = 0.06; // ~97m
        against that same anchor. This avoids losing genuine slow
        movement that happens to arrive in several small below-floor
        steps (each step alone under the floor, but the total drift
-       away from the anchor is real). */
+       away from the anchor is real).
+     - BUG FOUND IN FULL AUDIT (Sep 2026): the speed×time compensation
+       below used to measure dt from the ANCHOR to the new point. That
+       is correct for a genuine silent gap (tunnel/backgrounded — no
+       points at all in between, so anchor and "the previous point"
+       are the same thing). But when several fixes in a row get
+       REJECTED as jitter (e.g. sitting parked at a check-in for a few
+       minutes while GPS drifts a few meters), the anchor stays frozen
+       at the moment driving stopped while dt keeps growing — and once
+       real movement finally resumes, that stale multi-minute dt got
+       multiplied by driving speed as if the vehicle had been moving
+       at speed the entire time it was actually parked. Measured
+       impact in testing: a single stop with a 3-minute dwell inflated
+       that stop's distance by ~9x. Fix: measure dt/speed from the
+       IMMEDIATELY PRECEDING fix (prev), not the anchor — prev only
+       equals a stale anchor when there truly were no points recorded
+       in between (the genuine-gap case, unaffected by this fix); when
+       jitter was rejected in between, prev is the last (~stationary,
+       speed≈0) jitter fix, keeping dt small and the phantom distance
+       gone, while the correct anchor→point straight-line distance is
+       still used to size the real resumed-movement segment. */
 function cmi(){
   var pts = gpts;
   if(pts.length<2)return 0;
   var total=0;
   var anchor=pts[0];
+  var prev=pts[0];
   for(var i=1;i<pts.length;i++){
     var p=pts[i];
     var straight=haverMi(anchor,p);
@@ -667,14 +691,14 @@ function cmi(){
       // (coords.speed, m/s — the GPS chip derives this from Doppler
       // shift independent of position accuracy), integrate speed×time
       // for this gap as a second estimate and take whichever is
-      // larger. This directly compensates for corner-cutting instead
-      // of just filtering noise.
+      // larger. dt/speed come from the immediately preceding fix
+      // (see note above), not the anchor.
       var segDist=straight;
-      if(anchor.spd!=null || p.spd!=null){
-        var dtSec=(p.t-anchor.t)/1000;
+      if(prev.spd!=null || p.spd!=null){
+        var dtSec=(p.t-prev.t)/1000;
         if(dtSec>0){
           var speeds=[];
-          if(anchor.spd!=null)speeds.push(anchor.spd);
+          if(prev.spd!=null)speeds.push(prev.spd);
           if(p.spd!=null)speeds.push(p.spd);
           var avgSpd=speeds.reduce(function(a,b){return a+b;},0)/speeds.length; // m/s
           var speedDistMi=avgSpd*dtSec/1609.34;
@@ -689,6 +713,7 @@ function cmi(){
     }
     // else: within combined GPS uncertainty — treat as noise, keep
     // the same anchor and re-test against the next fix.
+    prev=p;
   }
   return total;
 }
@@ -957,6 +982,10 @@ function doSend(){
       if(gw)navigator.geolocation.clearWatch(gw);
       if(wl && !wl.released)wl.release();
       localStorage.removeItem('_ts3');
+      // Defensive reset: if this page is somehow reused for a second
+      // shift without a reload, don't let it start from a polluted
+      // state (old GPS trail / events / shift-start time).
+      gpts=[]; evs=[]; t0=null; man={s:'',e:'',c:''};
       btn.textContent='✅ Sent!';
       btn.style.background='#238636';
     },function(){
@@ -1076,9 +1105,21 @@ document.addEventListener('visibilitychange',function(){
 });
 
 /* ── Save/Restore ──────────────────────── */
+/* Cap on how many GPS points survive into localStorage. Only matters
+   if iOS fully evicts the backgrounded tab's process (not just
+   suspends it — evictions happen under memory pressure over a long
+   day) and the page has to cold-restore from localStorage; a normal
+   screen-lock/app-switch doesn't touch this at all (restore() is a
+   no-op while active===true, i.e. mid-shift — see visibilitychange
+   handler). Old cap was 300, which a busy day blows past by 8-10x
+   (~2,300 points in full-day testing), silently discarding hours of
+   earlier trail on a cold restore. 300 points × ~85 bytes/point is
+   nothing; 6000 is still well under a fraction of typical localStorage
+   quota (~5-10MB) and comfortably covers even a dense 16h+ day. */
+var GPS_SAVE_CAP = 6000;
 function save(){
   if(!active)return;
-  try{localStorage.setItem('_ts3',JSON.stringify({rep:rep,vehicle:vehicle,depName:depName,depAddr:depAddr,t0:t0.getTime(),evs:evs.map(function(e){return Object.assign({},e,{t:e.t instanceof Date?e.t.getTime():e.t});}),curLoc:curLoc,ciTime:ciTime?ciTime.getTime():null,gpts:gpts.slice(-300),man:man,saved:Date.now()}));}catch(x){}
+  try{localStorage.setItem('_ts3',JSON.stringify({rep:rep,vehicle:vehicle,depName:depName,depAddr:depAddr,t0:t0.getTime(),evs:evs.map(function(e){return Object.assign({},e,{t:e.t instanceof Date?e.t.getTime():e.t});}),curLoc:curLoc,ciTime:ciTime?ciTime.getTime():null,gpts:gpts.slice(-GPS_SAVE_CAP),man:man,saved:Date.now()}));}catch(x){}
 }
 function restore(){
   try{
