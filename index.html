@@ -242,7 +242,7 @@ input:focus,select:focus,textarea:focus{border-color:rgba(76,156,255,.75);box-sh
       <div class="logo-line"><span class="logo-premium">PREMIUM</span><span class="logo-k">K</span></div>
       <div class="logo-sub">TRONIC HOLDINGS</div>
       <div style="margin-top:6px;font-size:11px;color:#7d8590;letter-spacing:.5px;">
-        Ver 3.3 &nbsp;&middot;&nbsp; Updated Sep 03, 2026
+        Ver 4.0 &nbsp;&middot;&nbsp; Updated Sep 11, 2026
       </div>
     </div>
     <div class="hero-title">Daily Field Sales Report</div>
@@ -338,6 +338,7 @@ input:focus,select:focus,textarea:focus{border-color:rgba(76,156,255,.75);box-sh
   </div>
 
   <div id="gpsBanner" style="display:none;margin:0 12px 10px;padding:11px 13px;border-radius:10px;font-size:12px;line-height:1.5;"></div>
+  <div id="erpPendingBanner" style="display:none;margin:0 12px 10px;padding:11px 13px;border-radius:10px;font-size:12px;line-height:1.5;"></div>
   <div style="margin:0 12px 10px;padding:9px 13px;background:rgba(68,147,248,0.06);border:1px solid rgba(68,147,248,0.18);border-radius:10px;font-size:11px;color:#7d8590;line-height:1.5;">
     💡 Keep this screen unlocked and open while driving — GPS tracking pauses when the phone locks or you switch apps.
   </div>
@@ -403,7 +404,7 @@ input:focus,select:focus,textarea:focus{border-color:rgba(76,156,255,.75);box-sh
     <div class="sh-field"><label>Daily Summary <small style="color:#7d8590">(optional)</small></label><textarea id="endSum" placeholder="Highlights, issues..."></textarea></div>
     <div class="sh-field"><label>Tomorrow's Plan <small style="color:#7d8590">(optional)</small></label><textarea id="endPlan" placeholder="Planned visits..."></textarea></div>
     <div class="sh-btns">
-      <button type="button" class="sh-btn sh-cancel" onclick="closeModal('mEnd')">Cancel</button>
+      <button type="button" class="sh-btn sh-cancel" onclick="cancelEnd()">Cancel</button>
       <button type="button" class="sh-btn sh-red" id="sendBtn" onclick="doSend()">📤 Send Report</button>
     </div>
   </div>
@@ -416,6 +417,8 @@ var rep='', vehicle='Company Vehicle';
 var t0=null, active=false, tickID=null, elapsed=0;
 var evs=[], curLoc=null, ciTime=null, man={s:'',e:'',c:''};
 var gw=null, gpts=[], gmap=null, gpoly=null, gmk=null, geo=null, wl=null;
+var shiftOriginPt=null; // first GPS fix of the shift — persisted separately, never truncated (audit F04)
+var shiftId=null; // stable per-shift ID for ERP dedup (audit F11)
 var gpsStatus='idle'; // idle | active | denied | paused
 var gpsRetryTimer=null, wakeReacquireTimer=null;
 var mapsOk=false, ejsOk=false;
@@ -465,6 +468,14 @@ function startShift(){
   vehicle=vr?vr.value:'Company Vehicle';
   if(depName==='Custom'){var ca=(document.getElementById('customDept').value||'').trim();if(ca){depAddr=ca;}}
   t0=new Date();active=true;
+  // Audit F11: the ERP backend has no way to tell a genuine retry
+  // (safe to dedupe) apart from a real second sync — this generates a
+  // stable ID for the whole shift once, reused across every sync
+  // attempt/retry, so the backend has what it needs to dedupe once
+  // that support is added server-side (client-side prerequisite only
+  // — the actual dedup logic has to live in worklog.js, outside what
+  // this file can fix).
+  shiftId = (crypto && crypto.randomUUID) ? crypto.randomUUID() : ('shift_'+Date.now()+'_'+Math.random().toString(36).slice(2));
   document.getElementById('tbRep').textContent=rep;
   document.getElementById('tbDate').textContent=t0.toLocaleDateString('en-US',{weekday:'short',month:'short',day:'numeric',year:'numeric'});
   document.getElementById('setupPanel').style.display='none';
@@ -594,17 +605,23 @@ function onGPS(pos){
   var tms=(typeof pos.timestamp==='number'?pos.timestamp:Date.now());
   var now=new Date(tms);
   if(gpsStatus!=='active'){ gpsStatus='active'; setGpsBanner(null); }
+  var pt={lat:lat,lng:lng,t:tms,acc:(acc||30),spd:(pos.coords.speed!=null&&pos.coords.speed>=0?pos.coords.speed:null)};
   if(gpts.length===0&&mapsOk)initMap(lat,lng);
-  gpts.push({lat:lat,lng:lng,t:tms,acc:(acc||30),spd:(pos.coords.speed!=null&&pos.coords.speed>=0?pos.coords.speed:null)});
+  if(!shiftOriginPt) shiftOriginPt=pt; // permanent — never truncated, used as the Directions-API origin (audit F04)
+  gpts.push(pt);
+  accumulateTrailPoint(pt);
   if(gpoly)gpoly.getPath().push(new google.maps.LatLng(lat,lng));
   if(gmk)gmk.setMap(null);
   if(gmap){gmk=new google.maps.Marker({position:{lat:lat,lng:lng},map:gmap,icon:{path:google.maps.SymbolPath.FORWARD_CLOSED_ARROW,scale:5,fillColor:'#3fb950',fillOpacity:1,strokeColor:'#fff',strokeWeight:2,rotation:pos.coords.heading||0}});gmap.panTo({lat:lat,lng:lng});}
   document.getElementById('mPts').textContent=gpts.length;
   document.getElementById('mMi').textContent=cmi().toFixed(2);
   document.getElementById('mUpd').textContent=ft(now);
-  var ca=document.getElementById('ciAddr');
-  if(document.getElementById('mCI').classList.contains('open')&&!ca.value&&geo)
-    geo.geocode({location:{lat:lat,lng:lng}},function(r,s){if(s==='OK'&&r[0])ca.value=r[0].formatted_address;});
+  // NOTE (audit F07): this used to also try to live-fill a #ciAddr
+  // input while the Check-In modal was open, but that field was
+  // removed when Check-In was simplified to name-only — the address
+  // is now geocoded after submit, directly in doCI(). The old code
+  // referenced the now-nonexistent element and threw a TypeError on
+  // every GPS update received while the modal happened to be open.
 }
 /* Haversine distance between two lat/lng points (miles) */
 function haverMi(a, b){
@@ -669,53 +686,122 @@ var ACC_FLOOR_CAP_MI = 0.06; // ~97m
        speed≈0) jitter fix, keeping dt small and the phantom distance
        gone, while the correct anchor→point straight-line distance is
        still used to size the real resumed-movement segment. */
-function cmi(){
-  var pts = gpts;
-  if(pts.length<2)return 0;
-  var total=0;
-  var anchor=pts[0];
-  var prev=pts[0];
-  for(var i=1;i<pts.length;i++){
-    var p=pts[i];
-    var straight=haverMi(anchor,p);
-    var accA=(anchor.acc!=null?anchor.acc:30);
-    var accB=(p.acc!=null?p.acc:30);
-    var accFloorMi=Math.min(ACC_FLOOR_CAP_MI,(accA+accB)/1609.34);
-    var floor=Math.max(JITTER_FLOOR_MI,accFloorMi);
-    if(straight>=floor){
-      // Real movement confirmed. On any gap where the road curves or
-      // turns between two fixes, the straight-line distance UNDER-
-      // counts the actual path (this gets worse the longer the gap —
-      // e.g. after the phone was locked/backgrounded for minutes on a
-      // highway). When the device reports a speed for either fix
-      // (coords.speed, m/s — the GPS chip derives this from Doppler
-      // shift independent of position accuracy), integrate speed×time
-      // for this gap as a second estimate and take whichever is
-      // larger. dt/speed come from the immediately preceding fix
-      // (see note above), not the anchor.
-      var segDist=straight;
-      if(prev.spd!=null || p.spd!=null){
-        var dtSec=(p.t-prev.t)/1000;
-        if(dtSec>0){
-          var speeds=[];
-          if(prev.spd!=null)speeds.push(prev.spd);
-          if(p.spd!=null)speeds.push(p.spd);
-          var avgSpd=speeds.reduce(function(a,b){return a+b;},0)/speeds.length; // m/s
-          var speedDistMi=avgSpd*dtSec/1609.34;
-          // Sanity cap: don't let one bad speed reading imply a
-          // sustained >90mph pace over a long silent gap.
-          var capMi=dtSec*(90/3600);
-          segDist=Math.max(straight, Math.min(speedDistMi, capMi));
-        }
-      }
-      total+=segDist;
-      anchor=p;
+/* Audit F04 fix: distance used to be recomputed from scratch by
+   replaying the ENTIRE gpts array every time — which meant if gpts
+   ever got truncated (e.g. only the last GPS_SAVE_CAP points survive
+   a cold localStorage restore), the recomputed total silently lost
+   whatever distance the missing early points represented. Measured:
+   a 72mi trail truncated to its last 6,000 points recomputed as
+   59.99mi — 12mi quietly gone.
+   Fix: track the distance as a RUNNING TOTAL (cumulativeTrailMi),
+   updated incrementally by exactly one step each time a new GPS fix
+   arrives (see accumulateTrailPoint, called from onGPS). The running
+   total and its anchor/prev state are persisted directly (a few
+   numbers, not the whole trail) and survive gpts truncation
+   completely intact, because they never need to be recomputed from
+   the point array again. */
+var trailAnchor=null, trailPrev=null, cumulativeTrailMi=0;
+function trailSegmentDist(anchor, prev, p){
+  var straight=haverMi(anchor,p);
+  var accA=(anchor.acc!=null?anchor.acc:30);
+  var accB=(p.acc!=null?p.acc:30);
+  var accFloorMi=Math.min(ACC_FLOOR_CAP_MI,(accA+accB)/1609.34);
+  var floor=Math.max(JITTER_FLOOR_MI,accFloorMi);
+  if(straight<floor) return null; // rejected as noise
+  var segDist=straight;
+  if(prev.spd!=null || p.spd!=null){
+    var dtSec=(p.t-prev.t)/1000;
+    if(dtSec>0){
+      var speeds=[];
+      if(prev.spd!=null)speeds.push(prev.spd);
+      if(p.spd!=null)speeds.push(p.spd);
+      var avgSpd=speeds.reduce(function(a,b){return a+b;},0)/speeds.length;
+      var speedDistMi=avgSpd*dtSec/1609.34;
+      var capMi=dtSec*(90/3600);
+      segDist=Math.max(straight, Math.min(speedDistMi, capMi));
     }
-    // else: within combined GPS uncertainty — treat as noise, keep
-    // the same anchor and re-test against the next fix.
-    prev=p;
   }
-  return total;
+  return segDist;
+}
+function accumulateTrailPoint(p){
+  if(!trailAnchor){ trailAnchor=p; trailPrev=p; return; }
+  var d=trailSegmentDist(trailAnchor, trailPrev, p);
+  if(d!=null){ cumulativeTrailMi+=d; trailAnchor=p; }
+  trailPrev=p;
+}
+/* Diagnostic-only GPS trail estimate (see note above cmi() usage in
+   doSend). O(1) now — just returns the running total instead of
+   replaying the whole array. */
+function cmi(){ return cumulativeTrailMi; }
+/* cmi() above is now a DIAGNOSTIC / fallback figure only — it is the
+   app's best estimate of the raw GPS trail, useful for sanity-
+   checking and for the on-screen live counter, but it is not what
+   pay is calculated from (see computeOfficialDistance below). Its
+   fundamental limitation (per audit F03) is that it can only ever
+   reason about the points it actually received: any real gap in
+   coverage still has to be estimated somehow, and estimates are not
+   the same thing as a measured distance. */
+
+/* ── Official mileage: real drivable-road distance (audit F03/F04) ──
+   Instead of inferring distance from the raw (sometimes sparse, noisy,
+   or gap-riddled) GPS trail, ask Google's Directions service for the
+   actual DRIVING route distance between the shift's CONFIRMED points
+   — HQ → each Check-In (in visit order) → final GPS position — and
+   sum the route legs. This is Google's own road-network graph
+   ("차량이 이동 가능한 도로 기준"), so it:
+     - is not affected by GPS gaps, jitter, or accuracy at all — it
+       only needs the confirmed stop coordinates, not a continuous
+       trail;
+     - is reproducible/auditable — the same stops always yield the
+       same distance, so it can't drift between runs;
+     - can't be inflated by circling/detours or deflated by dropped
+       points, since it's the optimal road route between fixed points.
+   Trade-off to know: it reflects the route Google would recommend
+   between the confirmed stops, which may differ slightly from the
+   exact path actually driven (traffic detours, wrong turns). That is
+   the standard, industry-accepted basis most mileage-reimbursement
+   tools use (e.g. "map distance between addresses"), and it is a much
+   stronger, harder-to-dispute basis for pay than a self-reported trail
+   estimate. If this call fails (offline, quota, API error), the
+   report clearly falls back to the GPS-trail estimate AND labels it
+   as unconfirmed rather than presenting it as equally authoritative
+   (addresses the audit's "measured vs. estimated vs. confirmed" ask). */
+function computeOfficialDistance(cb){
+  if(typeof google==='undefined' || !google.maps || !google.maps.DirectionsService){
+    cb(null, 'Maps not loaded');
+    return;
+  }
+  var ciStops = evs.filter(function(e){return e.tp==='ci' && e.lat!=null && e.lng!=null;});
+  var originPt = shiftOriginPt || (gpts.length ? gpts[0] : null);
+  var destPt   = gpts.length ? gpts[gpts.length-1] : null;
+  if(!originPt || !destPt){
+    cb(null, 'No GPS points recorded');
+    return;
+  }
+  // DirectionsService (JS client library) accepts up to 25 waypoints
+  // per request. Sales shifts with more stops than that in one day
+  // are not expected, but guard against it rather than silently
+  // dropping stops from the official figure.
+  if(ciStops.length>23){
+    cb(null, 'Too many stops for one Directions request ('+ciStops.length+')');
+    return;
+  }
+  var svc = new google.maps.DirectionsService();
+  svc.route({
+    origin: {lat:originPt.lat, lng:originPt.lng},
+    destination: {lat:destPt.lat, lng:destPt.lng},
+    waypoints: ciStops.map(function(s){return {location:{lat:s.lat,lng:s.lng}, stopover:true};}),
+    optimizeWaypoints: false, // keep the rep's actual visit order
+    travelMode: 'DRIVING'
+  }, function(result, status){
+    if(status!=='OK' || !result.routes || !result.routes[0]){
+      cb(null, 'Directions request failed ('+status+')');
+      return;
+    }
+    var legs = result.routes[0].legs || [];
+    var meters = legs.reduce(function(sum,leg){return sum + (leg.distance ? leg.distance.value : 0);}, 0);
+    cb(meters/1609.34, null);
+  });
 }
 
 /* ── Check In (single-tap) ─────────────── */
@@ -735,32 +821,51 @@ function doCI(){
   var n=(document.getElementById('ciName').value||'').trim();
   if(!n){return;}
   var now=new Date(), l=gpts.length?gpts[gpts.length-1]:null;
-  var ev={tp:'ci',t:now,n:n,a:'',lat:l?l.lat:null,lng:l?l.lng:null};
+  // Audit F08: don't silently attach an arbitrarily old GPS fix to a
+  // brand-new check-in — if the last fix is stale (phone lost signal,
+  // rep walked away from the car, etc.) or too imprecise, the location
+  // isn't actually confirmed for THIS visit. Say so instead of
+  // pretending a 3-hour-old point is where they are right now.
+  var FRESH_MS = 90000; // 90s
+  var STALE_ACC_M = 150;
+  var freshEnough = l && (now.getTime()-l.t) <= FRESH_MS && (l.acc==null || l.acc<=STALE_ACC_M);
+  var evId = (crypto && crypto.randomUUID) ? crypto.randomUUID() : ('ci_'+now.getTime()+'_'+Math.random().toString(36).slice(2));
+  var ev={tp:'ci',id:evId,t:now,n:n,a:'',lat:freshEnough?l.lat:null,lng:freshEnough?l.lng:null,locConfirmed:!!freshEnough};
   evs.push(ev);
   closeModal('mCI');
   // Fill in the address in the background — doesn't block the flow,
   // just enriches the report if it resolves before Send.
-  if(l&&geo){
+  if(freshEnough&&geo){
     geo.geocode({location:{lat:l.lat,lng:l.lng}},function(r,s){
       if(s==='OK'&&r[0])ev.a=r[0].formatted_address;
     });
   }
-  if(gmap&&l){
+  if(gmap&&freshEnough){
     new google.maps.Marker({position:{lat:l.lat,lng:l.lng},map:gmap,
       label:{text:String(evs.filter(function(e){return e.tp==='ci';}).length),color:'#0d1117',fontSize:'11px',fontWeight:'700'},
       icon:{path:google.maps.SymbolPath.CIRCLE,scale:11,fillColor:'#3fb950',fillOpacity:1,strokeColor:'#fff',strokeWeight:2}});
   }
-  document.getElementById('stSub').textContent='✅ Checked in — '+n;
+  document.getElementById('stSub').textContent=freshEnough ? '✅ Checked in — '+n : '✅ Checked in — '+n+' (location unconfirmed)';
   setTimeout(function(){
     document.getElementById('stSub').textContent='Tap Check In when you arrive';
   },2500);
   renderTL();save();
 }
 function doNote(){var t=(document.getElementById('noteText').value||'').trim();if(!t)return;evs.push({tp:'note',t:new Date(),tx:t});document.getElementById('noteText').value='';closeModal('mNote');renderTL();save();}
-function doMan(){man.s=document.getElementById('manS').value;man.e=document.getElementById('manE').value;man.c=document.getElementById('manC').value;closeModal('mMan');}
+function doMan(){man.s=document.getElementById('manS').value;man.e=document.getElementById('manE').value;man.c=document.getElementById('manC').value;closeModal('mMan');save();}
 
 /* ── End Shift ─────────────────────────── */
-function onEnd(){openModal('mEnd');}
+function onEnd(){
+  if(!t0){
+    // Shift already completed (successfully sent+synced, or cancelled
+    // out of an ERP retry) — t0 gets cleared only at that point.
+    // Opening the modal again would crash later on t0.toLocaleDateString
+    // (audit F06). Nothing left to end.
+    document.getElementById('stSub').textContent='This shift has already been sent. Reload the page to start a new one.';
+    return;
+  }
+  openModal('mEnd');
+}
 /* ── Polyline encoder ─────────────────────────────────────── */
 function _pv(v){
   v=v<0?~(v<<1):v<<1;
@@ -793,7 +898,10 @@ function buildMapUrl(pts, stops){
   var s=pts[0], e=pts[pts.length-1];
   var u='https://maps.googleapis.com/maps/api/staticmap'
       +'?size=640x400&scale=2&maptype=roadmap';
-  // Dark map style
+  // Dark map style. NOTE (audit F10 fix): each entry below already
+  // includes its own "0x" prefix — the old code additionally
+  // prepended a literal "0x" when building the style param, producing
+  // an invalid "color:0x0x1a1f2e" that Google would reject/ignore.
   ['all|geometry|0x1a1f2e',
    'road|geometry|0x2a3050',
    'road|geometry.stroke|0x4c9cff',
@@ -804,7 +912,7 @@ function buildMapUrl(pts, stops){
   ].forEach(function(s){
     var p=s.split('|');
     if(p.length===3)
-      u+='&style=feature:'+p[0]+'|element:'+p[1]+'|color:0x'+p[2];
+      u+='&style=feature:'+p[0]+'|element:'+p[1]+'|color:'+p[2];
     else
       u+='&style=feature:'+p[0]+'|'+p[1];
   });
@@ -816,12 +924,20 @@ function buildMapUrl(pts, stops){
   // End marker — red E
   u+='&markers=color:red|size:mid|label:E'
     +'|'+e.lat.toFixed(5)+','+e.lng.toFixed(5);
-  // Stop markers — blue numbers
+  // Stop markers — numbered. NOTE (audit F10 fix): Google's Static
+  // Maps API only draws a label on "mid"/"normal"-size markers (not
+  // "small"/"tiny"), and a label must be exactly one character —
+  // the old code used size:small (which silently drops the label)
+  // with two-digit labels like "10", "11" (invalid even if size were
+  // right). Fixed to size:mid, and stops past the 9th cycle through
+  // A, B, C... so every label stays a single valid character.
   if(stops&&stops.length){
     stops.forEach(function(st,i){
-      if(st.lat&&st.lng)
-        u+='&markers=color:blue|size:small|label:'+(i+1)
+      if(st.lat&&st.lng){
+        var label = i<9 ? String(i+1) : String.fromCharCode(65+((i-9)%26));
+        u+='&markers=color:blue|size:mid|label:'+label
           +'|'+st.lat.toFixed(5)+','+st.lng.toFixed(5);
+      }
     });
   }
   u+='&key='+KEY;
@@ -850,23 +966,76 @@ function buildMapsLink(pts, stops){
 }
 
 /* ── doSend ───────────────────────────────────────────────── */
+/* Bug found from field screenshot (Sep 2026): the modal used to close
+   the instant "Send Report" was tapped — before knowing whether the
+   send even succeeded. That meant the rep never actually SAW the
+   "⏳ Sending..." / "❌ Failed — retry" state (it was updating a
+   button hidden behind the now-closed modal), so on failure they had
+   no visible feedback and would tap "End Shift" again — which re-ran
+   the whole function from scratch, pushing a SECOND "Shift End /
+   Company HQ" timeline entry each time (visible as a duplicate in the
+   route timeline) and rebuilding the report from that point instead
+   of really retrying the original attempt.
+   Fix: split into buildEndOfShiftReport() (runs once per End Shift,
+   pushes the single Shift-End marker, freezes the report text/values)
+   and attemptSend() (does just the emailjs.send call + button state,
+   safe to call repeatedly for retries without touching evs/state
+   again). The modal now only closes on confirmed success; Cancel
+   rolls back the speculative Shift-End marker so the rep can keep
+   working instead. */
+var pendingSend = null;
+var sendInFlight = false; // true while an emailjs.send/ERP request is actually in flight (audit F06 — prevents Cancel racing a live request)
+
 function doSend(){
+  var btn=document.getElementById('sendBtn');
+  if(pendingSend){
+    if(pendingSend.emailSent){
+      // Email already went out — only the ERP sync is still pending/
+      // failed. Retry just that, never resend the email.
+      retryErpOnly();
+      return;
+    }
+    // Retrying a failed attempt — reuse exactly what was already
+    // built; do not touch evs or rebuild the report.
+    attemptSend(btn);
+    return;
+  }
+  btn.textContent='⏳ Calculating road distance...';
+  btn.disabled=true;
+  computeOfficialDistance(function(officialMi, err){
+    buildAndSendReport(btn, officialMi, err);
+  });
+}
+
+function buildAndSendReport(btn, officialMi, distErr){
   var now=new Date();
   var oe=(document.getElementById('endOdo').value||'').trim();
   var es=(document.getElementById('endSum').value||'').trim();
   var ep=(document.getElementById('endPlan').value||'').trim();
 
-  evs.push({tp:'ret',t:now,n:'Company HQ',a:HQ});
-  closeModal('mEnd');
+  // Honest end-of-shift marker: we don't actually know the rep drove
+  // back to HQ (audit F08) — just record that the shift ended here,
+  // at whatever the last known GPS position was.
+  var evRet={tp:'ret',t:now,n:'Shift Ended'};
+  evs.push(evRet);
   renderTL();
 
   var tot=Math.floor((now.getTime()-t0.getTime())/1000);
   var hrs=(tot/3600).toFixed(2);
-  var gmi=cmi();
+
+  // GPS-trail estimate is now a secondary/diagnostic figure — never
+  // silently treated as equally authoritative to the road-network
+  // figure (audit F03). gmiOfficial is null if the Directions request
+  // failed or wasn't possible; the report says so explicitly rather
+  // than quietly falling back without telling anyone.
+  var gmiTrail = cmi();
+  var gmiOfficial = officialMi; // miles, or null
+  var gmi = (gmiOfficial!=null) ? gmiOfficial : gmiTrail; // used for pay below
+  var distanceConfirmed = (gmiOfficial!=null);
   var isP=vehicle==='Personal Vehicle';
   // Self-reported miles: rep enters what they believe they drove today
   // (their own odometer/estimate), used only to compare against the
-  // app's GPS-calculated mileage — not used for pay calculation.
+  // app's calculated mileage — not used for pay calculation.
   var repMi = oe ? parseFloat(oe) : null;
   var repMiTxt = repMi!==null && !isNaN(repMi) ? repMi.toFixed(1) : '—';
   var diffTxt = '—';
@@ -876,7 +1045,7 @@ function doSend(){
   }
 
   // GPS start / end / check-in stops
-  var gpsStart = gpts.length ? gpts[0]             : null;
+  var gpsStart = shiftOriginPt || (gpts.length ? gpts[0] : null);
   var gpsEnd   = gpts.length ? gpts[gpts.length-1] : null;
   var ciStops  = evs.filter(function(e){return e.tp==='ci';});
 
@@ -891,7 +1060,7 @@ function doSend(){
   // stop names, and check-in times line up with what's on the map).
   var legendHtml = ciStops.map(function(c,i){
     return '<tr>'+
-      '<td style="padding:4px 8px 4px 0;color:#4c9cff;font-weight:700;white-space:nowrap;">'+(i+1)+'.</td>'+
+      '<td style="padding:4px 8px 4px 0;color:#4c9cb8;font-weight:700;white-space:nowrap;">'+(i+1)+'.</td>'+
       '<td style="padding:4px 8px;">'+escHtml(c.n)+'</td>'+
       '<td style="padding:4px 0;color:#7d8590;white-space:nowrap;text-align:right;">'+ft(c.t)+'</td>'+
     '</tr>';
@@ -900,19 +1069,22 @@ function doSend(){
     ? '<table style="width:100%;border-collapse:collapse;font-size:13px;font-family:sans-serif;">'+legendHtml+'</table>'
     : '';
 
-  // Route timeline text
+  // Route timeline text. "min since last stop" instead of "min drive"
+  // (audit F08) — we only know elapsed time between two logged
+  // events, not that all of it was spent driving (could include time
+  // stopped for lunch, waiting, etc. with no separate check-out step).
   var lines=[],pv=t0,pn=depName;
   evs.forEach(function(e){
     var dm=Math.round((e.t.getTime()-pv.getTime())/60000);
     if(e.tp==='dep'){
       lines.push(ft(e.t)+'  🏢 DEPARTED — '+e.n+(e.a&&e.a!==e.n?' ('+e.a+')':''));
     } else if(e.tp==='ci'){
-      if(dm>0)lines.push('           ↓ '+dm+' min drive from '+pn);
+      if(dm>0)lines.push('           ↓ '+dm+' min since last stop');
       lines.push(ft(e.t)+'  📍 '+e.n+(e.a?' ('+e.a+')':''));
       pv=e.t; pn=e.n;
     } else if(e.tp==='ret'){
-      if(dm>0)lines.push('           ↓ '+dm+' min drive from '+pn);
-      lines.push(ft(e.t)+'  🏁 RETURNED — '+e.n);
+      if(dm>0)lines.push('           ↓ '+dm+' min since last stop');
+      lines.push(ft(e.t)+'  🏁 SHIFT ENDED');
     } else if(e.tp==='note'){
       lines.push(ft(e.t)+'  📝 '+e.tx);
     }
@@ -930,6 +1102,21 @@ function doSend(){
   locLines+='GPS Points:     '+gpts.length+' points recorded';
   if(mapsLink)locLines+='\nGoogle Maps:    '+mapsLink;
 
+  var mileageBlock;
+  if(distanceConfirmed){
+    mileageBlock =
+      'Official Distance: '+gmi.toFixed(1)+' mi (Google road-route between confirmed stops — used for pay)\n'+
+      'GPS Trail (raw):    '+gmiTrail.toFixed(1)+' mi (diagnostic only, not used for pay)\n'+
+      'Rep-Reported:       '+repMiTxt+' mi (self-reported, optional)\n'+
+      'Variance (official vs. rep): '+diffTxt+'\n';
+  } else {
+    mileageBlock =
+      '⚠️ UNCONFIRMED — Google road-distance lookup failed ('+(distErr||'unknown error')+')\n'+
+      'GPS Trail Estimate: '+gmi.toFixed(1)+' mi (NOT independently confirmed — review before paying)\n'+
+      'Rep-Reported:       '+repMiTxt+' mi (self-reported, optional)\n'+
+      'Variance (estimate vs. rep): '+diffTxt+'\n';
+  }
+
   var msg=
 '━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n'+
 '📋 DAILY SALES REPORT\n'+
@@ -941,15 +1128,8 @@ function doSend(){
 'Shift Start:  '+ft(t0)+'\n'+
 'Shift End:    '+ft(now)+'\n'+
 'Total Hours:  '+p2(Math.floor(tot/3600))+'h '+p2(Math.floor((tot%3600)/60))+'m ('+hrs+' hrs)\n'+
-(isP?
-  'GPS Miles:      '+gmi.toFixed(1)+' mi (app-calculated, used for pay)\n'+
-  'Rep-Reported:   '+repMiTxt+' mi (self-reported, optional)\n'+
-  'Variance:       '+diffTxt+'\n'+
-  'Mileage Pay:    $'+(gmi*0.35).toFixed(2)+' ($0.35/mi, based on GPS)\n':
-  'GPS Miles:      '+gmi.toFixed(1)+' mi\n'+
-  'Rep-Reported:   '+repMiTxt+' mi (self-reported, optional)\n'+
-  'Variance:       '+diffTxt+'\n'+
-  '(Company vehicle — no mileage pay)\n')+
+mileageBlock+
+(isP?'Mileage Pay:  $'+(gmi*0.35).toFixed(2)+' ($0.35/mi'+(distanceConfirmed?', based on confirmed road distance':', based on UNCONFIRMED estimate — verify before payroll')+')\n':'(Company vehicle — no mileage pay)\n')+
 '\n📍 VISITS ('+ci.length+' stops)\n─────────────\n'+vl+
 '\n\n🗺 ROUTE TIMELINE\n─────────────\n'+lines.join('\n')+
 '\n\n📡 GPS SUMMARY\n─────────────\n'+locLines+
@@ -958,65 +1138,230 @@ function doSend(){
 (man.c?'\n\n📋 MANUAL NOTES\n─────────────\n'+man.c:'')+
 '\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━';
 
-  var btn=document.getElementById('sendBtn');
+  pendingSend = { evRet:evRet, msg:msg, mapUrl:mapUrl, mapsLink:mapsLink, gpsStart:gpsStart, gpsEnd:gpsEnd, gmi:gmi, distanceConfirmed:distanceConfirmed, legendTable:legendTable };
+  attemptSend(btn);
+}
+
+function attemptSend(btn){
+  var data = pendingSend;
   btn.textContent='⏳ Sending...';
   btn.disabled=true;
+  sendInFlight=true;
+  // Once a report is frozen for sending, further edits to these
+  // fields would NOT be reflected in a retry (retries intentionally
+  // reuse the exact frozen report — see note above pendingSend). Lock
+  // them so the UI doesn't imply otherwise (audit F06).
+  ['endOdo','endSum','endPlan'].forEach(function(id){
+    var el=document.getElementById(id); if(el) el.disabled=true;
+  });
 
   loadEJS(function(){
     emailjs.send('service_e5e12zp','template_qefp126',{
       rep_name:    rep,
       date:        t0.toLocaleDateString('en-US',{month:'long',day:'numeric',year:'numeric'}),
-      message:     msg,
-      map_url:     mapUrl    || 'https://maps.googleapis.com/maps/api/staticmap?size=640x200&zoom=10&center=34.0,-118.1&key=AIzaSyClcWpuT__fvAhvbAd2MDeaKEPL5UI_FVc',
-      maps_link:   mapsLink  || 'https://maps.google.com',
-      gps_start:   gpsStart  ? gpsStart.lat.toFixed(5)+', '+gpsStart.lng.toFixed(5) : 'GPS not available',
-      gps_end:     gpsEnd    ? gpsEnd.lat.toFixed(5)+', '+gpsEnd.lng.toFixed(5)     : 'GPS not available',
-      total_miles: gmi.toFixed(1) || '0.0',
-      visit_legend: legendTable || '<p style="color:#7d8590;font-size:13px;">No check-ins recorded.</p>'
+      message:     data.msg,
+      map_url:     data.mapUrl    || 'https://maps.googleapis.com/maps/api/staticmap?size=640x200&zoom=10&center=34.0,-118.1&key=AIzaSyClcWpuT__fvAhvbAd2MDeaKEPL5UI_FVc',
+      maps_link:   data.mapsLink  || 'https://maps.google.com',
+      gps_start:   data.gpsStart  ? data.gpsStart.lat.toFixed(5)+', '+data.gpsStart.lng.toFixed(5) : 'GPS not available',
+      gps_end:     data.gpsEnd    ? data.gpsEnd.lat.toFixed(5)+', '+data.gpsEnd.lng.toFixed(5)     : 'GPS not available',
+      total_miles: data.gmi.toFixed(1) || '0.0',
+      visit_legend: data.legendTable || '<p style="color:#7d8590;font-size:13px;">No check-ins recorded.</p>'
     }).then(function(){
-      syncToERP(btn); // 이메일 발송 성공 후 Tronic ERP로도 근무/방문기록 자동 전송 (실패해도 이메일 리포트에는 영향 없음)
-      active=false;
+      // Shift tracking is genuinely over now — stop the timer/GPS/
+      // wake lock — but DO NOT wipe evs/gpts/t0/_ts3 yet (audit F01):
+      // if ERP sync fails or the page gets evicted before it resolves,
+      // this is the only copy of the report data left to retry from.
+      sendInFlight=false;
       clearInterval(tickID);
       if(gpsRetryTimer)clearInterval(gpsRetryTimer);
       if(wakeReacquireTimer)clearInterval(wakeReacquireTimer);
       if(gw)navigator.geolocation.clearWatch(gw);
       if(wl && !wl.released)wl.release();
-      localStorage.removeItem('_ts3');
-      // Defensive reset: if this page is somehow reused for a second
-      // shift without a reload, don't let it start from a polluted
-      // state (old GPS trail / events / shift-start time).
-      gpts=[]; evs=[]; t0=null; man={s:'',e:'',c:''};
-      btn.textContent='✅ Sent!';
-      btn.style.background='#238636';
-    },function(){
-      btn.textContent='❌ Failed — retry';
+      pendingSend.emailSent=true;
+      save();
+      updateErpBanner('pending','📧 Emailed — syncing to ERP...');
+      syncToERP(function(ok, msg){
+        if(ok){ finalizeAfterErpSuccess(); }
+        else{
+          updateErpBanner('failed','⚠️ Emailed — ERP: '+msg+' — tap End Shift to retry ERP');
+          save();
+        }
+      });
+    },function(err){
+      sendInFlight=false;
+      // Keep the modal open and pendingSend intact so the rep sees
+      // the failure right where they are and can just tap retry —
+      // no rebuilt report, no duplicate Shift-End marker.
+      // Surface the ACTUAL error (EmailJS rejects with {status,text})
+      // instead of a generic message, so a screenshot of this is
+      // enough to diagnose the real cause (wrong domain, bad service/
+      // template ID, quota, template variable mismatch, etc.) without
+      // another round trip.
+      console.error('[EmailJS send failed]', err);
+      var detail = '';
+      if(err && typeof err==='object'){
+        if(err.status!=null) detail += ' ('+err.status;
+        if(err.text) detail += (err.status!=null?': ':' (')+err.text;
+        if(detail) detail += ')';
+      } else if(err){
+        detail = ' ('+String(err)+')';
+      }
+      btn.textContent='❌ Failed'+detail+' — retry';
       btn.disabled=false;
     });
+  }, function(loadErr){
+    // EmailJS SDK itself failed to load (blocked, offline, CDN down).
+    // Without this, the button was left stuck on "Sending..." forever
+    // with no way to retry (audit F06).
+    sendInFlight=false;
+    console.error('[EmailJS SDK load failed]', loadErr);
+    btn.textContent='❌ Failed ('+loadErr+') — retry';
+    btn.disabled=false;
   });
 }
-function loadEJS(cb){
+
+/* Always-visible status for "emailed but ERP not yet confirmed" — this
+   banner lives in the main app screen (not inside the End Shift
+   modal), so the state is visible even after the modal closes or was
+   never reopened. Mirrors the same text into the modal's Send button
+   when that modal happens to be open. Addresses audit F01: the ERP
+   failure badge used to be attached beside a button inside an already-
+   closed modal, effectively invisible. */
+function updateErpBanner(kind, msg){
+  var el=document.getElementById('erpPendingBanner');
+  if(!kind){ el.style.display='none'; return; }
+  var styles={
+    pending:'background:rgba(240,136,62,0.1);border:1px solid rgba(240,136,62,0.35);color:#f0883e;',
+    failed: 'background:rgba(248,81,73,0.1);border:1px solid rgba(248,81,73,0.35);color:#f85149;',
+    ok:     'background:rgba(63,185,80,0.1);border:1px solid rgba(63,185,80,0.35);color:#3fb950;'
+  };
+  el.style.cssText='margin:0 12px 10px;padding:11px 13px;border-radius:10px;font-size:12px;line-height:1.5;display:block;'+(styles[kind]||'');
+  el.textContent=msg;
+  var btn=document.getElementById('sendBtn');
+  if(btn && document.getElementById('mEnd').classList.contains('open')){
+    btn.textContent=msg;
+    btn.disabled=(kind==='pending');
+  }
+}
+function retryErpOnly(){
+  var btn=document.getElementById('sendBtn');
+  updateErpBanner('pending','⏳ Retrying ERP sync...');
+  if(btn) btn.disabled=true;
+  syncToERP(function(ok, msg){
+    if(ok){ finalizeAfterErpSuccess(); }
+    else{
+      updateErpBanner('failed','⚠️ Emailed — ERP: '+msg+' — tap to retry ERP');
+      save();
+    }
+  });
+}
+function finalizeAfterErpSuccess(){
+  active=false;
+  clearInterval(tickID);
+  if(gpsRetryTimer)clearInterval(gpsRetryTimer);
+  if(wakeReacquireTimer)clearInterval(wakeReacquireTimer);
+  if(gw)navigator.geolocation.clearWatch(gw);
+  if(wl && !wl.released)wl.release();
+  localStorage.removeItem('_ts3');
+  pendingSend=null;
+  closeModal('mEnd');
+  updateErpBanner('ok','✅ Report emailed and synced to ERP.');
+  setTimeout(function(){ updateErpBanner(null); }, 6000);
+  gpts=[]; evs=[]; t0=null; man={s:'',e:'',c:''};
+  var btn=document.getElementById('sendBtn');
+  if(btn){ btn.textContent='✅ Sent & Synced!'; btn.style.background='#238636'; }
+}
+
+/* Cancel on the End Shift sheet:
+   - If email hasn't been sent yet (still editing/failed before send):
+     roll back the speculative Shift-End marker so the rep can keep
+     working (e.g. log another stop) instead of being left with a
+     phantom "shift ended" entry that was never actually emailed.
+   - If email already sent and only ERP sync is pending/failed:
+     the report is already out — rolling back the marker now would
+     make the app's own timeline disagree with what was emailed. This
+     path instead acknowledges "give up retrying ERP for now" and
+     cleans up, while being explicit that ERP was never confirmed
+     (rather than silently pretending it succeeded). */
+function cancelEnd(){
+  if(sendInFlight){
+    // A real network request is actively in flight — cancelling now
+    // would let a late-arriving response act on state that Cancel
+    // already tore down (audit F06). Just ask them to wait the few
+    // seconds it takes; nothing productive to cancel mid-request.
+    document.getElementById('stSub').textContent='Please wait — send in progress...';
+    return;
+  }
+  if(pendingSend && pendingSend.emailSent){
+    localStorage.removeItem('_ts3');
+    updateErpBanner('failed','⚠️ Emailed — ERP sync not confirmed (cancelled). Check ERP manually.');
+    pendingSend=null;
+    active=false;
+    gpts=[]; evs=[]; t0=null; man={s:'',e:'',c:''};
+    closeModal('mEnd');
+    return;
+  }
+  if(pendingSend && pendingSend.evRet){
+    var idx=evs.indexOf(pendingSend.evRet);
+    if(idx!==-1){ evs.splice(idx,1); renderTL(); }
+  }
+  pendingSend=null;
+  ['endOdo','endSum','endPlan'].forEach(function(id){
+    var el=document.getElementById(id); if(el) el.disabled=false;
+  });
+  var btn=document.getElementById('sendBtn');
+  btn.textContent='📤 Send Report';
+  btn.disabled=false;
+  btn.style.background='';
+  closeModal('mEnd');
+}
+function loadEJS(cb, onFail){
   if(ejsOk){cb();return;}
+  var done=false;
+  var timer=setTimeout(function(){
+    if(done)return; done=true;
+    if(onFail) onFail('EmailJS script load timed out');
+  }, 12000);
   var s=document.createElement('script');
   s.src='https://cdn.jsdelivr.net/npm/@emailjs/browser@4/dist/email.min.js';
-  s.onload=function(){emailjs.init('1xqHVrcs5xrGDcNed');ejsOk=true;cb();};
+  s.onload=function(){
+    if(done)return; done=true; clearTimeout(timer);
+    emailjs.init('1xqHVrcs5xrGDcNed');ejsOk=true;cb();
+  };
+  s.onerror=function(){
+    if(done)return; done=true; clearTimeout(timer);
+    if(onFail) onFail('EmailJS script failed to load (blocked or offline)');
+  };
   document.head.appendChild(s);
 }
 
 /* ── Tronic ERP 연동 ──────────────────────
    기존 이메일 리포트는 그대로 유지하면서, 체크인한 방문기록(장소/주소/시간)을
    Tronic ERP의 "방문 기록" 화면에도 자동으로 쌓이도록 전송한다.
-   실패해도(오프라인 등) 이메일 발송 자체는 이미 끝난 뒤라 리포트 전송에는 영향 없음. */
+
+   감사 F01 수정: 이전에는 이메일 성공 직후 ERP 응답을 기다리지 않고 로컬
+   백업(_ts3)과 이벤트/GPS 배열을 곧바로 지웠다 — ERP가 오프라인이거나
+   실패해도 재전송할 원본이 이미 사라진 뒤였다. 이제 이메일 성공 후에도
+   ERP 결과가 나올 때까지 로컬 데이터를 보존하고, ERP가 확정 성공한 뒤에만
+   정리한다. 실패하면 화면에 계속 보이는 재시도 버튼을 남긴다.
+
+   감사 F05 수정: t0.toISOString()은 UTC 자정 기준이라 미국 현지 저녁
+   근무가 다음 날짜로 넘어갈 수 있었다. 로컬 연/월/일로 직접 조합한다. */
+function localDateStr(d){
+  return d.getFullYear()+'-'+String(d.getMonth()+1).padStart(2,'0')+'-'+String(d.getDate()).padStart(2,'0');
+}
 var ERP_SYNC_URL = 'https://tronic-erp2-production.up.railway.app/api/worklog/sync-shift';
 var ERP_SYNC_KEY = 'Vyu6XFinHT8V0tHi6_lRQPOa7RF99a15'; // Railway Variables의 WORKLOG_SYNC_KEY와 동일해야 함
-function syncToERP(btnEl){
+function syncToERP(cb){
   try{
     var ciList=evs.filter(function(e){return e.tp==='ci';}).map(function(c){
-      return {name:c.n, time:c.t.toISOString(), address:c.a||''};
+      return {event_id:c.id||null, name:c.n, time:c.t.toISOString(), address:c.a||''};
     });
-    if(ciList.length===0) return; // 체크인한 곳이 없으면 보낼 데이터도 없음
+    if(ciList.length===0){ cb(true,'체크인 기록 없음 — 동기화 생략'); return; }
     var payload={
+      shift_id: shiftId,
       rep_name: rep,
-      work_date: t0.toISOString().slice(0,10),
+      work_date: localDateStr(t0),
       check_ins: ciList
     };
     fetch(ERP_SYNC_URL,{
@@ -1024,22 +1369,29 @@ function syncToERP(btnEl){
       headers:{'Content-Type':'application/json','x-worklog-sync-key':ERP_SYNC_KEY},
       body:JSON.stringify(payload)
     }).then(function(r){
-      if(!r.ok){
-        r.text().then(function(t){
-          console.error('[ERP 동기화 실패] status='+r.status+' body='+t);
-          showSyncBadge(btnEl, false, 'ERP 동기화 실패 ('+r.status+')');
-        });
-      } else {
-        console.log('[ERP 동기화 성공]');
-        showSyncBadge(btnEl, true, 'ERP 동기화 완료 ('+ciList.length+'건)');
-      }
+      r.text().then(function(bodyText){
+        var savedCount = null;
+        try{ var j=JSON.parse(bodyText); if(j && typeof j.visits_saved==='number') savedCount=j.visits_saved; }catch(x){}
+        if(!r.ok){
+          console.error('[ERP 동기화 실패] status='+r.status+' body='+bodyText);
+          cb(false, 'ERP 동기화 실패 ('+r.status+')');
+        } else if(savedCount!=null && savedCount!==ciList.length){
+          // 서버가 실제 저장 개수를 알려줬는데 보낸 개수와 다르면, 200 OK여도
+          // 그대로 "완료"라고 하지 않는다 (감사 F01 — 서버 확인 개수 사용).
+          console.error('[ERP 부분 저장] sent='+ciList.length+' saved='+savedCount);
+          cb(false, 'ERP 부분 저장 ('+savedCount+'/'+ciList.length+'건만 저장됨)');
+        } else {
+          console.log('[ERP 동기화 성공]');
+          cb(true, 'ERP 동기화 완료 ('+(savedCount!=null?savedCount:ciList.length)+'건)');
+        }
+      });
     }).catch(function(e){
       console.error('[ERP 동기화 네트워크 오류]', e);
-      showSyncBadge(btnEl, false, 'ERP 연결 실패 (네트워크/카톡브라우저 제한 가능)');
+      cb(false, 'ERP 연결 실패 (네트워크/카톡브라우저 제한 가능)');
     });
   }catch(x){
     console.error('[ERP 동기화 예외]', x);
-    showSyncBadge(btnEl, false, 'ERP 동기화 오류');
+    cb(false, 'ERP 동기화 오류');
   }
 }
 
@@ -1067,10 +1419,16 @@ function renderTL(){
   var h='';
   evs.forEach(function(e,i){
     var last=i===evs.length-1,dc='',bc='#30363d',pl='',det='',tag='';
-    if(e.tp==='dep'){bc='#4493f8';pl='🏢 '+e.n;det=e.a&&e.a!==e.n?e.a:'';tag='<span class="tag tag-b">Shift Start</span>';}
-    else if(e.tp==='ci'){bc='#3fb950';pl='📍 '+e.n;det=e.a||'';tag='<span class="tag tag-g">Checked In</span>';}
-    else if(e.tp==='ret'){bc='#4493f8';pl='🏁 '+e.n;tag='<span class="tag tag-b">Shift End</span>';}
-    else if(e.tp==='note'){bc='#f0883e';pl='📝 Note';det=e.tx;}
+    // Audit F10: place names, notes, and addresses are free text the
+    // rep (or a geocoder response) supplies — concatenating them
+    // straight into innerHTML let something like a place name of
+    // "<img src=x onerror=...>" execute as real HTML/JS in a page
+    // that also holds live EmailJS/ERP/Maps keys. escHtml() (already
+    // used for the email's visit legend) neutralizes that here too.
+    if(e.tp==='dep'){bc='#4493f8';pl='🏢 '+escHtml(e.n);det=e.a&&e.a!==e.n?escHtml(e.a):'';tag='<span class="tag tag-b">Shift Start</span>';}
+    else if(e.tp==='ci'){bc='#3fb950';pl='📍 '+escHtml(e.n)+(e.locConfirmed===false?' <span style="color:#f0883e">(location unconfirmed)</span>':'');det=e.a?escHtml(e.a):'';tag='<span class="tag tag-g">Checked In</span>';}
+    else if(e.tp==='ret'){bc='#4493f8';pl='🏁 '+escHtml(e.n);tag='<span class="tag tag-b">Shift End</span>';}
+    else if(e.tp==='note'){bc='#f0883e';pl='📝 Note';det=escHtml(e.tx);}
     h+='<div class="tl-item"><div class="tl-s"><div class="dot" style="background:'+bc+'"></div>'+(last?'':'<div class="tl-l"></div>')+'</div><div class="tl-c"><div class="tl-t">'+ft(e.t)+'</div><div class="tl-p">'+pl+'</div>'+(det?'<div class="tl-d">'+det+'</div>':'')+tag+'</div></div>';
   });
   tl.innerHTML=h;
@@ -1119,7 +1477,24 @@ document.addEventListener('visibilitychange',function(){
 var GPS_SAVE_CAP = 6000;
 function save(){
   if(!active)return;
-  try{localStorage.setItem('_ts3',JSON.stringify({rep:rep,vehicle:vehicle,depName:depName,depAddr:depAddr,t0:t0.getTime(),evs:evs.map(function(e){return Object.assign({},e,{t:e.t instanceof Date?e.t.getTime():e.t});}),curLoc:curLoc,ciTime:ciTime?ciTime.getTime():null,gpts:gpts.slice(-GPS_SAVE_CAP),man:man,saved:Date.now()}));}catch(x){}
+  try{
+    var endDraft={
+      odo:(document.getElementById('endOdo')||{}).value||'',
+      sum:(document.getElementById('endSum')||{}).value||'',
+      plan:(document.getElementById('endPlan')||{}).value||''
+    };
+    localStorage.setItem('_ts3',JSON.stringify({
+      rep:rep,vehicle:vehicle,depName:depName,depAddr:depAddr,t0:t0.getTime(),
+      evs:evs.map(function(e){return Object.assign({},e,{t:e.t instanceof Date?e.t.getTime():e.t});}),
+      curLoc:curLoc,ciTime:ciTime?ciTime.getTime():null,
+      gpts:gpts.slice(-GPS_SAVE_CAP),
+      shiftOriginPt:shiftOriginPt,trailAnchor:trailAnchor,trailPrev:trailPrev,cumulativeTrailMi:cumulativeTrailMi,
+      shiftId:shiftId,
+      man:man,endDraft:endDraft,
+      pendingEmailSent:!!(pendingSend && pendingSend.emailSent),
+      saved:Date.now()
+    }));
+  }catch(x){}
 }
 function restore(){
   try{
@@ -1130,6 +1505,20 @@ function restore(){
     t0=new Date(s.t0);active=true;
     evs=(s.evs||[]).map(function(e){return Object.assign({},e,{t:new Date(e.t)});});
     curLoc=s.curLoc;ciTime=s.ciTime?new Date(s.ciTime):null;gpts=s.gpts||[];man=s.man||{s:'',e:'',c:''};
+    shiftOriginPt=s.shiftOriginPt||(gpts.length?gpts[0]:null);
+    trailAnchor=s.trailAnchor||null;trailPrev=s.trailPrev||null;cumulativeTrailMi=s.cumulativeTrailMi||0;
+    shiftId=s.shiftId||null;
+    // If a send attempt was in progress but failed/never confirmed
+    // before the page reloaded, its speculative Shift-End marker is
+    // now orphaned — pendingSend itself isn't persisted, so a fresh
+    // End Shift attempt would push a SECOND one on top of it (audit
+    // F06, reproduced: two "Shift End" entries after retry-after-
+    // reload). Roll back an orphaned trailing 'ret' so the next
+    // attempt starts clean, unless that 'ret' is the one whose email
+    // we know already sent (pendingEmailSent — handled below instead).
+    if(!s.pendingEmailSent && evs.length && evs[evs.length-1].tp==='ret'){
+      evs.pop();
+    }
     document.getElementById('tbRep').textContent=rep;
     document.getElementById('tbDate').textContent=t0.toLocaleDateString('en-US',{weekday:'short',month:'short',day:'numeric',year:'numeric'});
     document.getElementById('setupPanel').style.display='none';
@@ -1140,6 +1529,25 @@ function restore(){
     if(wakeReacquireTimer)clearInterval(wakeReacquireTimer);
     wakeReacquireTimer=setInterval(reacquireWakeLock,120000);
     renderTL();
+    // Restore End Shift draft inputs (audit F09) — if the rep had
+    // started typing a summary/plan/mileage before a reload, don't
+    // silently lose it even though the modal isn't open yet.
+    if(s.endDraft){
+      if(document.getElementById('endOdo')) document.getElementById('endOdo').value=s.endDraft.odo||'';
+      if(document.getElementById('endSum')) document.getElementById('endSum').value=s.endDraft.sum||'';
+      if(document.getElementById('endPlan')) document.getElementById('endPlan').value=s.endDraft.plan||'';
+    }
+    // If email was already sent before the reload and only ERP sync
+    // was pending, pick that back up automatically instead of leaving
+    // it silently unresolved (audit F01).
+    if(s.pendingEmailSent){
+      pendingSend={emailSent:true};
+      updateErpBanner('pending','📧 Previously emailed — retrying ERP sync...');
+      syncToERP(function(ok, msg){
+        if(ok){ finalizeAfterErpSuccess(); }
+        else{ updateErpBanner('failed','⚠️ Emailed — ERP: '+msg+' — tap End Shift to retry ERP'); save(); }
+      });
+    }
     setInterval(save,30000);
   }catch(x){}
 }
